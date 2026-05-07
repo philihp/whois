@@ -4,6 +4,7 @@ import {
   CheckDomainAvailabilityCommand,
   ListPricesCommand,
 } from '@aws-sdk/client-route-53-domains';
+import { fromWebIdentity } from '@aws-sdk/credential-providers';
 import * as R from 'ramda';
 import { validate } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
@@ -12,10 +13,30 @@ import { pickPriceForDomain } from '@/lib/pricing';
 const region = 'us-east-1';
 
 // Lazily instantiate so cold-start cost is paid once per warm Lambda.
+// When AWS_ROLE_ARN is set (Vercel + OIDC), credentials are obtained by
+// exchanging the per-invocation VERCEL_OIDC_TOKEN for short-lived STS creds.
+// Locally, the default credential chain (AWS profile / env vars) is used.
 const getClient = (() => {
   let client: Route53DomainsClient | undefined;
   return (): Route53DomainsClient => {
-    if (!client) client = new Route53DomainsClient({ region });
+    if (!client) {
+      const roleArn = process.env.AWS_ROLE_ARN;
+      client = new Route53DomainsClient({
+        region,
+        ...(roleArn && {
+          credentials: fromWebIdentity({
+            roleArn,
+            // Read token at credential-refresh time so a recycled Lambda
+            // container picks up a fresh VERCEL_OIDC_TOKEN automatically.
+            webIdentityToken: () => {
+              const token = process.env.VERCEL_OIDC_TOKEN;
+              if (!token) throw new Error('VERCEL_OIDC_TOKEN not set');
+              return Promise.resolve(token);
+            },
+          }),
+        }),
+      });
+    }
     return client;
   };
 })();
