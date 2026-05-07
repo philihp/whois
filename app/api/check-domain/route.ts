@@ -98,7 +98,7 @@ export async function POST(req: NextRequest) {
     const message =
       err instanceof Error ? err.message : 'Unknown error from AWS';
     return NextResponse.json(
-      { error: 'AWS error', detail: message },
+      { error: `AWS error: ${message}`, detail: message },
       { status: 502 },
     );
   }
