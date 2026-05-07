@@ -4,7 +4,7 @@ import {
   CheckDomainAvailabilityCommand,
   ListPricesCommand,
 } from '@aws-sdk/client-route-53-domains';
-import { fromWebIdentity } from '@aws-sdk/credential-providers';
+import { fromWebToken } from '@aws-sdk/credential-providers';
 import * as R from 'ramda';
 import { validate } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
@@ -21,19 +21,11 @@ const getClient = (() => {
   return (): Route53DomainsClient => {
     if (!client) {
       const roleArn = process.env.AWS_ROLE_ARN;
+      const webIdentityToken = process.env.VERCEL_OIDC_TOKEN;
       client = new Route53DomainsClient({
         region,
-        ...(roleArn && {
-          credentials: fromWebIdentity({
-            roleArn,
-            // Read token at credential-refresh time so a recycled Lambda
-            // container picks up a fresh VERCEL_OIDC_TOKEN automatically.
-            webIdentityToken: () => {
-              const token = process.env.VERCEL_OIDC_TOKEN;
-              if (!token) throw new Error('VERCEL_OIDC_TOKEN not set');
-              return Promise.resolve(token);
-            },
-          }),
+        ...(roleArn && webIdentityToken && {
+          credentials: fromWebToken({ roleArn, webIdentityToken }),
         }),
       });
     }
