@@ -12,26 +12,19 @@ import { pickPriceForDomain } from '@/lib/pricing';
 // Route 53 Domains is only available in us-east-1.
 const region = 'us-east-1';
 
-// Lazily instantiate so cold-start cost is paid once per warm Lambda.
 // When AWS_ROLE_ARN is set (Vercel + OIDC), credentials are obtained by
 // exchanging the per-invocation VERCEL_OIDC_TOKEN for short-lived STS creds.
 // Locally, the default credential chain (AWS profile / env vars) is used.
-const getClient = (() => {
-  let client: Route53DomainsClient | undefined;
-  return (): Route53DomainsClient => {
-    if (!client) {
-      const roleArn = process.env.AWS_ROLE_ARN;
-      const webIdentityToken = process.env.VERCEL_OIDC_TOKEN;
-      client = new Route53DomainsClient({
-        region,
-        ...(roleArn && webIdentityToken && {
-          credentials: fromWebToken({ roleArn, webIdentityToken }),
-        }),
-      });
-    }
-    return client;
-  };
-})();
+const client = new Route53DomainsClient({
+  region,
+  ...(process.env.AWS_ROLE_ARN &&
+    process.env.VERCEL_OIDC_TOKEN && {
+      credentials: fromWebToken({
+        roleArn: process.env.AWS_ROLE_ARN,
+        webIdentityToken: process.env.VERCEL_OIDC_TOKEN,
+      }),
+    }),
+});
 
 type PriceShape = {
   amount: number;
@@ -60,8 +53,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: result.error }, { status: 400 });
   }
   const { domain } = result;
-
-  const client = getClient();
 
   try {
     // Availability check.
