@@ -28,6 +28,39 @@ type PriceShape = {
   currency: string;
 } | null;
 
+type ThrottleResult =
+  | { throttled: false }
+  | { throttled: true; retryAfter: number };
+
+type SuccessBody = {
+  domain: string;
+  status: string;
+  price: PriceShape;
+  throttleMs: number;
+};
+
+const THROTTLE_COOKIE = 'last_check';
+
+const checkThrottle = (req: NextRequest): ThrottleResult => {
+  const throttleMs = parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
+  const raw = req.cookies.get(THROTTLE_COOKIE)?.value;
+  if (!raw) return { throttled: false };
+  const lastCheck = parseInt(raw, 10);
+  if (Number.isNaN(lastCheck)) return { throttled: false };
+  const elapsed = Date.now() - lastCheck;
+  if (elapsed >= throttleMs) return { throttled: false };
+  return { throttled: true, retryAfter: throttleMs - elapsed };
+};
+
+const setThrottleCookie = (response: NextResponse): void => {
+  response.cookies.set(THROTTLE_COOKIE, String(Date.now()), {
+    httpOnly: true,
+    sameSite: 'strict',
+    path: '/',
+    // No `secure`: works on http://localhost in dev; Vercel enforces HTTPS in prod
+  });
+};
+
 const toMessage = (err: unknown): string =>
   err instanceof Error ? err.message : 'Unknown error from AWS';
 
@@ -41,6 +74,14 @@ const extractRegistrationPrice = (entry: unknown): PriceShape => {
 };
 
 export async function POST(req: NextRequest) {
+  const throttle = checkThrottle(req);
+  if (throttle.throttled) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait.', retryAfter: throttle.retryAfter },
+      { status: 429 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await req.json();
@@ -93,7 +134,11 @@ export async function POST(req: NextRequest) {
       // Pricing is optional; swallow and return availability only.
     }
 
-    return NextResponse.json({ domain, status, price });
+    const throttleMs = parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
+    const responseBody: SuccessBody = { domain, status, price, throttleMs };
+    const response = NextResponse.json(responseBody);
+    setThrottleCookie(response);
+    return response;
   } catch (err) {
     const message = toMessage(err);
     return NextResponse.json(

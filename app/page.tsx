@@ -1,18 +1,26 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import * as R from 'ramda';
 
 type CheckResult = {
   domain: string;
   status: string;
   price: { amount: number; currency: string } | null;
+  throttleMs: number;
 };
 
 type ApiError = { error: string; detail?: string };
 
+type ThrottleErrorBody = { error: string; retryAfter: number };
+
 const isCheckResult = (v: unknown): v is CheckResult =>
-  R.has('status', v as object) && R.has('domain', v as object);
+  R.has('status', v as object) &&
+  R.has('domain', v as object) &&
+  R.has('throttleMs', v as object);
+
+const isThrottleError = (v: unknown): v is ThrottleErrorBody =>
+  R.has('retryAfter', v as object);
 
 const formatPrice = (p: CheckResult['price']): string =>
   p ? `${p.amount.toFixed(2)} ${p.currency}` : 'price unavailable';
@@ -37,6 +45,29 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cooldownUntil, setCooldownUntil] = useState<number | null>(null);
+  const [cooldownTotal, setCooldownTotal] = useState<number>(0);
+  const [progress, setProgress] = useState<number>(0);
+
+  useEffect(() => {
+    if (cooldownUntil === null) {
+      setProgress(0);
+      return;
+    }
+    let rafId: number;
+    const tick = () => {
+      const remaining = cooldownUntil - Date.now();
+      if (remaining <= 0) {
+        setProgress(0);
+        setCooldownUntil(null);
+        return;
+      }
+      setProgress((remaining / cooldownTotal) * 100);
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [cooldownUntil, cooldownTotal]);
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,12 +81,16 @@ export default function Home() {
         body: JSON.stringify({ domain: value }),
       });
       const data: unknown = await res.json();
-      if (!res.ok) {
-        const msg =
-          (data as ApiError).error ?? 'Something went wrong.';
-        setError(msg);
+      if (res.status === 429 && isThrottleError(data)) {
+        setError(data.error);
+        setCooldownTotal(data.retryAfter);
+        setCooldownUntil(Date.now() + data.retryAfter);
+      } else if (!res.ok) {
+        setError((data as ApiError).error ?? 'Something went wrong.');
       } else if (isCheckResult(data)) {
         setResult(data);
+        setCooldownTotal(data.throttleMs);
+        setCooldownUntil(Date.now() + data.throttleMs);
       } else {
         setError('Unexpected response.');
       }
@@ -65,6 +100,9 @@ export default function Home() {
       setLoading(false);
     }
   };
+
+  const isCoolingDown = cooldownUntil !== null && Date.now() < cooldownUntil;
+  const isDisabled = loading || isCoolingDown || value.trim().length === 0;
 
   return (
     <main
@@ -131,7 +169,7 @@ export default function Home() {
             />
             <button
               type="submit"
-              disabled={loading || value.trim().length === 0}
+              disabled={isDisabled}
               style={{
                 padding: '0 1.5rem',
                 background: 'var(--ink)',
@@ -140,14 +178,21 @@ export default function Home() {
                 fontSize: '0.875rem',
                 textTransform: 'uppercase',
                 letterSpacing: '0.1em',
-                opacity: loading || value.trim().length === 0 ? 0.5 : 1,
+                opacity: isDisabled ? 0.5 : 1,
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
                 transition: 'opacity 120ms',
               }}
             >
-              {loading ? '…' : 'check'}
+              {loading ? '…' : isCoolingDown ? 'wait' : 'check'}
             </button>
           </div>
         </form>
+
+        {isCoolingDown && (
+          <div className="throttle-bar-track">
+            <div className="throttle-bar-fill" style={{ width: `${progress}%` }} />
+          </div>
+        )}
 
         <div style={{ minHeight: 120, marginTop: '2rem' }}>
           {error && (
