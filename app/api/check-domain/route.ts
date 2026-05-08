@@ -4,7 +4,7 @@ import {
   CheckDomainAvailabilityCommand,
   ListPricesCommand,
 } from '@aws-sdk/client-route-53-domains';
-import { fromWebToken } from '@aws-sdk/credential-providers';
+import { awsCredentialsProvider } from '@vercel/functions/oidc';
 import * as R from 'ramda';
 import { validate } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
@@ -12,24 +12,24 @@ import { pickPriceForDomain } from '@/lib/pricing';
 // Route 53 Domains is only available in us-east-1.
 const region = 'us-east-1';
 
-// VERCEL_OIDC_TOKEN is per-invocation — must be read inside the request
-// handler, not at module load time.
+// awsCredentialsProvider from @vercel/functions/oidc fetches a fresh OIDC
+// token per-request via Vercel's IPC socket and exchanges it for short-lived
+// AWS credentials via STS AssumeRoleWithWebIdentity.
 const makeClient = () =>
   new Route53DomainsClient({
     region,
-    ...(process.env.AWS_ROLE_ARN &&
-      process.env.VERCEL_OIDC_TOKEN && {
-        credentials: fromWebToken({
-          roleArn: process.env.AWS_ROLE_ARN,
-          webIdentityToken: process.env.VERCEL_OIDC_TOKEN,
-        }),
-      }),
+    credentials: awsCredentialsProvider({
+      roleArn: process.env.AWS_ROLE_ARN!,
+    }),
   });
 
 type PriceShape = {
   amount: number;
   currency: string;
 } | null;
+
+const toMessage = (err: unknown): string =>
+  err instanceof Error ? err.message : 'Unknown error from AWS';
 
 // Pure: pulls registration price out of the AWS price entry shape.
 const extractRegistrationPrice = (entry: unknown): PriceShape => {
@@ -53,6 +53,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: result.error }, { status: 400 });
   }
   const { domain } = result;
+
+  if (!process.env.AWS_ROLE_ARN) {
+    return NextResponse.json(
+      { error: 'AWS_ROLE_ARN is not configured' },
+      { status: 500 },
+    );
+  }
 
   const client = makeClient();
 
@@ -88,8 +95,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ domain, status, price });
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Unknown error from AWS';
+    const message = toMessage(err);
     return NextResponse.json(
       { error: `AWS error: ${message}`, detail: message },
       { status: 502 },
