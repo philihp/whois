@@ -13,15 +13,15 @@ import { pickPriceForDomain } from '@/lib/pricing';
 // Route 53 Domains is only available in us-east-1.
 const region = 'us-east-1';
 
-// On Vercel, use OIDC for short-lived credentials. Locally, fall back to
-// standard AWS env vars (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+// Use static key credentials locally when present; fall back to Vercel OIDC
+// in production (VERCEL_OIDC_TOKEN is fetched dynamically per-request by the
+// library, so it never appears as a static process.env var to check against).
 const makeClient = () =>
   new Route53DomainsClient({
     region,
-    credentials:
-      process.env.VERCEL_OIDC_TOKEN !== undefined
-        ? awsCredentialsProvider({ roleArn: process.env.AWS_ROLE_ARN! })
-        : fromEnv(),
+    credentials: process.env.AWS_ACCESS_KEY_ID
+      ? fromEnv()
+      : awsCredentialsProvider({ roleArn: process.env.AWS_ROLE_ARN! }),
   });
 
 type PriceShape = {
