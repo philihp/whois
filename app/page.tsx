@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as R from 'ramda';
 
 type CheckResult = {
@@ -45,29 +45,34 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [cooldownUntil, setCooldownUntil] = useState<number | null>(null);
-  const [cooldownTotal, setCooldownTotal] = useState<number>(0);
-  const [progress, setProgress] = useState<number>(0);
+  const [throttleProgress, setThrottleProgress] = useState(0);
+  const [throttleEndsAt, setThrottleEndsAt] = useState<number | null>(null);
+  const [throttleTotalMs, setThrottleTotalMs] = useState(0);
+  const rafRef = useRef<number>(0);
+
+  const isThrottled = throttleEndsAt !== null;
 
   useEffect(() => {
-    if (cooldownUntil === null) {
-      setProgress(0);
-      return;
-    }
-    let rafId: number;
+    if (!throttleEndsAt) return;
     const tick = () => {
-      const remaining = cooldownUntil - Date.now();
+      const remaining = throttleEndsAt - Date.now();
       if (remaining <= 0) {
-        setProgress(0);
-        setCooldownUntil(null);
+        setThrottleProgress(1);
+        setThrottleEndsAt(null);
         return;
       }
-      setProgress((remaining / cooldownTotal) * 100);
-      rafId = requestAnimationFrame(tick);
+      setThrottleProgress(1 - remaining / throttleTotalMs);
+      rafRef.current = requestAnimationFrame(tick);
     };
-    rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  }, [cooldownUntil, cooldownTotal]);
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [throttleEndsAt, throttleTotalMs]);
+
+  const startThrottle = (ms: number) => {
+    setThrottleTotalMs(ms);
+    setThrottleEndsAt(Date.now() + ms);
+    setThrottleProgress(0);
+  };
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -82,15 +87,12 @@ export default function Home() {
       });
       const data: unknown = await res.json();
       if (res.status === 429 && isThrottleError(data)) {
-        setError(data.error);
-        setCooldownTotal(data.retryAfter);
-        setCooldownUntil(Date.now() + data.retryAfter);
+        startThrottle(data.retryAfter);
       } else if (!res.ok) {
         setError((data as ApiError).error ?? 'Something went wrong.');
       } else if (isCheckResult(data)) {
         setResult(data);
-        setCooldownTotal(data.throttleMs);
-        setCooldownUntil(Date.now() + data.throttleMs);
+        startThrottle(data.throttleMs);
       } else {
         setError('Unexpected response.');
       }
@@ -100,9 +102,6 @@ export default function Home() {
       setLoading(false);
     }
   };
-
-  const isCoolingDown = cooldownUntil !== null && Date.now() < cooldownUntil;
-  const isDisabled = loading || isCoolingDown || value.trim().length === 0;
 
   return (
     <main
@@ -169,30 +168,26 @@ export default function Home() {
             />
             <button
               type="submit"
-              disabled={isDisabled}
+              disabled={loading || isThrottled || value.trim().length === 0}
               style={{
                 padding: '0 1.5rem',
-                background: 'var(--ink)',
+                background: isThrottled
+                  ? `linear-gradient(to right, var(--ink) ${Math.round(throttleProgress * 100)}%, rgba(26,26,26,0.3) ${Math.round(throttleProgress * 100)}%)`
+                  : 'var(--ink)',
                 color: 'var(--bg)',
                 border: 'none',
                 fontSize: '0.875rem',
                 textTransform: 'uppercase',
                 letterSpacing: '0.1em',
-                opacity: isDisabled ? 0.5 : 1,
-                cursor: isDisabled ? 'not-allowed' : 'pointer',
-                transition: 'opacity 120ms',
+                opacity: loading || (!isThrottled && value.trim().length === 0) ? 0.5 : 1,
+                transition: isThrottled ? 'none' : 'opacity 120ms',
+                cursor: isThrottled ? 'default' : undefined,
               }}
             >
-              {loading ? '…' : isCoolingDown ? 'wait' : 'check'}
+              {loading || isThrottled ? '…' : 'check'}
             </button>
           </div>
         </form>
-
-        {isCoolingDown && (
-          <div className="throttle-bar-track">
-            <div className="throttle-bar-fill" style={{ width: `${progress}%` }} />
-          </div>
-        )}
 
         <div style={{ minHeight: 120, marginTop: '2rem' }}>
           {error && (

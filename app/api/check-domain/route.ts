@@ -5,6 +5,7 @@ import {
   ListPricesCommand,
 } from '@aws-sdk/client-route-53-domains';
 import { awsCredentialsProvider } from '@vercel/functions/oidc';
+import { fromEnv } from '@aws-sdk/credential-providers';
 import * as R from 'ramda';
 import { validate } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
@@ -12,15 +13,15 @@ import { pickPriceForDomain } from '@/lib/pricing';
 // Route 53 Domains is only available in us-east-1.
 const region = 'us-east-1';
 
-// awsCredentialsProvider from @vercel/functions/oidc fetches a fresh OIDC
-// token per-request via Vercel's IPC socket and exchanges it for short-lived
-// AWS credentials via STS AssumeRoleWithWebIdentity.
+// On Vercel, use OIDC for short-lived credentials. Locally, fall back to
+// standard AWS env vars (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
 const makeClient = () =>
   new Route53DomainsClient({
     region,
-    credentials: awsCredentialsProvider({
-      roleArn: process.env.AWS_ROLE_ARN!,
-    }),
+    credentials:
+      process.env.VERCEL_OIDC_TOKEN !== undefined
+        ? awsCredentialsProvider({ roleArn: process.env.AWS_ROLE_ARN! })
+        : fromEnv(),
   });
 
 type PriceShape = {
@@ -95,7 +96,7 @@ export async function POST(req: NextRequest) {
   }
   const { domain } = result;
 
-  if (!process.env.AWS_ROLE_ARN) {
+  if (!process.env.AWS_ROLE_ARN && process.env.VERCEL_OIDC_TOKEN !== undefined) {
     return NextResponse.json(
       { error: 'AWS_ROLE_ARN is not configured' },
       { status: 500 },
