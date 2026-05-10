@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import * as R from 'ramda';
 
@@ -82,39 +82,42 @@ function HomeContent() {
     return () => cancelAnimationFrame(rafRef.current);
   }, [throttleEndsAt, throttleTotalMs]);
 
-  const startThrottle = (ms: number) => {
+  const startThrottle = useCallback((ms: number) => {
     setThrottleTotalMs(ms);
     setThrottleEndsAt(Date.now() + ms);
     setThrottleProgress(0);
-  };
+  }, []);
 
-  const runQuery = async (domain: string) => {
-    setLoading(true);
-    setError(null);
-    setResult(null);
-    try {
-      const res = await fetch('/api/check-domain', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain }),
-      });
-      const data: unknown = await res.json();
-      if (res.status === 429 && isThrottleError(data)) {
-        startThrottle(data.retryAfter);
-      } else if (!res.ok) {
-        setError((data as ApiError).error ?? 'Something went wrong.');
-      } else if (isCheckResult(data)) {
-        setResult(data);
-        startThrottle(data.throttleMs);
-      } else {
-        setError('Unexpected response.');
+  const runQuery = useCallback(
+    async (domain: string) => {
+      setLoading(true);
+      setError(null);
+      setResult(null);
+      try {
+        const res = await fetch('/api/check-domain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ domain }),
+        });
+        const data: unknown = await res.json();
+        if (res.status === 429 && isThrottleError(data)) {
+          startThrottle(data.retryAfter);
+        } else if (!res.ok) {
+          setError((data as ApiError).error ?? 'Something went wrong.');
+        } else if (isCheckResult(data)) {
+          setResult(data);
+          startThrottle(data.throttleMs);
+        } else {
+          setError('Unexpected response.');
+        }
+      } catch {
+        setError('Network error. Try again.');
+      } finally {
+        setLoading(false);
       }
-    } catch {
-      setError('Network error. Try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    [startThrottle],
+  );
 
   // URL is the source of truth: react to changes (initial load, back/forward).
   useEffect(() => {
@@ -128,8 +131,7 @@ function HomeContent() {
     if (lastFetchedRef.current === domainParam) return;
     lastFetchedRef.current = domainParam;
     runQuery(domainParam);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [domainParam]);
+  }, [domainParam, runQuery]);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
