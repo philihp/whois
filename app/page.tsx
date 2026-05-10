@@ -17,7 +17,7 @@ type SingleResult = {
 type BulkEntry = {
   domain: string;
   tld: string;
-  status: string;
+  status: string; // includes 'PENDING' until the per-TLD check resolves
   price: Price;
 };
 
@@ -34,6 +34,8 @@ type ApiError = { error: string; detail?: string };
 
 type ThrottleErrorBody = { error: string; retryAfter: number };
 
+type AvailabilityResponse = { domain: string; status: string };
+
 const isCheckResult = (v: unknown): v is CheckResult => {
   if (!v || typeof v !== 'object') return false;
   const kind = (v as { kind?: unknown }).kind;
@@ -49,10 +51,11 @@ const isThrottleError = (v: unknown): v is ThrottleErrorBody =>
 const formatPrice = (p: Price): string =>
   p ? `${p.amount.toFixed(2)} ${p.currency}` : 'price unavailable';
 
-type Tone = 'available' | 'taken' | 'warn';
+type Tone = 'available' | 'taken' | 'warn' | 'pending';
 
 const statusLabel = (status: string): { text: string; tone: Tone } => {
   const map: Record<string, { text: string; tone: Tone }> = {
+    PENDING: { text: 'checking…', tone: 'pending' },
     AVAILABLE: { text: 'available', tone: 'available' },
     AVAILABLE_RESERVED: { text: 'reserved', tone: 'warn' },
     AVAILABLE_PREORDER: { text: 'preorder only', tone: 'warn' },
@@ -67,22 +70,36 @@ const statusLabel = (status: string): { text: string; tone: Tone } => {
   return map[status] ?? { text: status.toLowerCase(), tone: 'warn' };
 };
 
-const toneToColor = (tone: Tone): string =>
-  tone === 'available'
-    ? 'var(--accent)'
-    : tone === 'taken'
-    ? 'var(--error)'
-    : 'var(--warn)';
+const toneToColor = (tone: Tone): string => {
+  switch (tone) {
+    case 'available':
+      return 'var(--accent)';
+    case 'taken':
+      return 'var(--error)';
+    case 'warn':
+      return 'var(--warn)';
+    case 'pending':
+      return 'var(--muted)';
+  }
+};
 
-// Sort: available first, then by TLD alphabetically.
+// Sort: available first, then other availables, then pending, then taken.
 const sortBulk = (entries: ReadonlyArray<BulkEntry>): BulkEntry[] => {
-  const rank = (s: string): number =>
-    s === 'AVAILABLE' ? 0 : s.startsWith('AVAILABLE') ? 1 : 2;
+  const rank = (s: string): number => {
+    if (s === 'AVAILABLE') return 0;
+    if (s.startsWith('AVAILABLE')) return 1;
+    if (s === 'PENDING') return 2;
+    return 3;
+  };
   return [...entries].sort((a, b) => {
     const r = rank(a.status) - rank(b.status);
     return r !== 0 ? r : a.tld.localeCompare(b.tld);
   });
 };
+
+// Number of in-flight per-TLD availability fetches. Matches the server-side
+// global semaphore so we don't pile up queued requests at the edge.
+const FANOUT_CONCURRENCY = 4;
 
 export default function Home() {
   return (
@@ -106,6 +123,7 @@ function HomeContent() {
   const [throttleTotalMs, setThrottleTotalMs] = useState(0);
   const rafRef = useRef<number>(0);
   const lastFetchedRef = useRef<string | null>(null);
+  const fanoutAbortRef = useRef<AbortController | null>(null);
 
   const isThrottled = throttleEndsAt !== null;
 
@@ -131,8 +149,62 @@ function HomeContent() {
     setThrottleProgress(0);
   }, []);
 
+  const startFanout = useCallback((bulk: BulkResult) => {
+    fanoutAbortRef.current?.abort();
+    const ac = new AbortController();
+    fanoutAbortRef.current = ac;
+
+    const queue = bulk.results.map((r) => r.domain);
+
+    const updateRow = (domain: string, status: string) => {
+      setResult((prev) => {
+        if (!prev || prev.kind !== 'bulk') return prev;
+        return {
+          ...prev,
+          results: prev.results.map((r) =>
+            r.domain === domain ? { ...r, status } : r,
+          ),
+        };
+      });
+    };
+
+    const worker = async () => {
+      while (!ac.signal.aborted) {
+        const domain = queue.shift();
+        if (!domain) return;
+        try {
+          const res = await fetch('/api/check-availability', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domain }),
+            signal: ac.signal,
+          });
+          if (ac.signal.aborted) return;
+          if (!res.ok) {
+            updateRow(domain, 'ERROR');
+            continue;
+          }
+          const data = (await res.json()) as AvailabilityResponse;
+          if (ac.signal.aborted) return;
+          updateRow(domain, data.status ?? 'ERROR');
+        } catch (err) {
+          if (
+            err instanceof DOMException &&
+            err.name === 'AbortError'
+          ) {
+            return;
+          }
+          updateRow(domain, 'ERROR');
+        }
+      }
+    };
+
+    for (let i = 0; i < FANOUT_CONCURRENCY; i++) void worker();
+  }, []);
+
   const runQuery = useCallback(
     async (domain: string) => {
+      fanoutAbortRef.current?.abort();
       setLoading(true);
       setError(null);
       setResult(null);
@@ -150,6 +222,7 @@ function HomeContent() {
         } else if (isCheckResult(data)) {
           setResult(data);
           startThrottle(data.throttleMs);
+          if (data.kind === 'bulk') startFanout(data);
         } else {
           setError('Unexpected response.');
         }
@@ -159,13 +232,14 @@ function HomeContent() {
         setLoading(false);
       }
     },
-    [startThrottle],
+    [startThrottle, startFanout],
   );
 
   // URL is the source of truth: react to changes (initial load, back/forward).
   useEffect(() => {
     setValue(domainParam);
     if (!domainParam) {
+      fanoutAbortRef.current?.abort();
       setResult(null);
       setError(null);
       lastFetchedRef.current = null;
@@ -175,6 +249,9 @@ function HomeContent() {
     lastFetchedRef.current = domainParam;
     runQuery(domainParam);
   }, [domainParam, runQuery]);
+
+  // Cancel in-flight fanout on unmount.
+  useEffect(() => () => fanoutAbortRef.current?.abort(), []);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -368,6 +445,9 @@ function SingleBlock({ result }: { result: SingleResult }) {
 
 function BulkBlock({ result }: { result: BulkResult }) {
   const sorted = sortBulk(result.results);
+  const total = sorted.length;
+  const pending = sorted.filter((r) => r.status === 'PENDING').length;
+  const checked = total - pending;
   const availableCount = sorted.filter((r) => r.status === 'AVAILABLE').length;
 
   return (
@@ -391,7 +471,7 @@ function BulkBlock({ result }: { result: BulkResult }) {
           marginBottom: '1rem',
         }}
       >
-        {availableCount} available · {sorted.length} TLDs scanned
+        {availableCount} available · {checked} of {total} checked
       </div>
       <ul
         style={{
@@ -415,6 +495,8 @@ function BulkBlock({ result }: { result: BulkResult }) {
                 padding: '0.5rem 0',
                 borderBottom: '1px solid rgba(0,0,0,0.06)',
                 fontSize: '0.875rem',
+                opacity: entry.status === 'PENDING' ? 0.55 : 1,
+                transition: 'opacity 200ms',
               }}
             >
               <span style={{ wordBreak: 'break-all' }}>{entry.domain}</span>

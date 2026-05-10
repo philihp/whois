@@ -4,28 +4,10 @@ import {
   CheckDomainAvailabilityCommand,
   ListPricesCommand,
 } from '@aws-sdk/client-route-53-domains';
-import { awsCredentialsProvider } from '@vercel/functions/oidc';
-import { fromEnv } from '@aws-sdk/credential-providers';
 import * as R from 'ramda';
 import { parseInput } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
-
-// Bulk gTLD scans fan out one CheckDomainAvailability call per TLD.
-export const maxDuration = 60;
-
-// Route 53 Domains is only available in us-east-1.
-const region = 'us-east-1';
-
-// Use static key credentials locally when present; fall back to Vercel OIDC
-// in production (VERCEL_OIDC_TOKEN is fetched dynamically per-request by the
-// library, so it never appears as a static process.env var to check against).
-const makeClient = () =>
-  new Route53DomainsClient({
-    region,
-    credentials: process.env.AWS_ACCESS_KEY_ID
-      ? fromEnv()
-      : awsCredentialsProvider({ roleArn: process.env.AWS_ROLE_ARN! }),
-  });
+import { isOidcConfigured, makeClient, toAwsErrorMessage } from '@/lib/aws';
 
 type PriceShape = {
   amount: number;
@@ -44,7 +26,7 @@ type ThrottleResult =
 type BulkResultEntry = {
   domain: string;
   tld: string;
-  status: string;
+  status: 'PENDING';
   price: PriceShape;
 };
 
@@ -84,9 +66,6 @@ const setThrottleCookie = (response: NextResponse): void => {
     // No `secure`: works on http://localhost in dev; Vercel enforces HTTPS in prod
   });
 };
-
-const toMessage = (err: unknown): string =>
-  err instanceof Error ? err.message : 'Unknown error from AWS';
 
 // Pure: pulls registration price out of the AWS price entry shape.
 const extractRegistrationPrice = (entry: unknown): PriceShape => {
@@ -154,7 +133,7 @@ const handleSingle = async (
     setThrottleCookie(response);
     return response;
   } catch (err) {
-    const message = toMessage(err);
+    const message = toAwsErrorMessage(err);
     return NextResponse.json(
       { error: `AWS error: ${message}`, detail: message },
       { status: 502 },
@@ -162,6 +141,9 @@ const handleSingle = async (
   }
 };
 
+// Bulk path returns the TLD list and prices but does NOT check availability.
+// Clients fan out per-TLD calls to /api/check-availability, which is globally
+// concurrency-limited to avoid AWS throttling.
 const handleBulk = async (
   client: Route53DomainsClient,
   word: string,
@@ -170,45 +152,23 @@ const handleBulk = async (
   try {
     prices = await listAllTldPrices(client);
   } catch (err) {
-    const message = toMessage(err);
+    const message = toAwsErrorMessage(err);
     return NextResponse.json(
       { error: `AWS error: ${message}`, detail: message },
       { status: 502 },
     );
   }
 
-  const tlds = prices
-    .map((p) => p.Name)
-    .filter((n): n is string => typeof n === 'string' && n.length > 0);
-  const priceByTld = new Map<string, PriceShape>(
-    prices.map((p) => [p.Name ?? '', extractRegistrationPrice(p)]),
-  );
-
-  const settled = await Promise.allSettled(
-    tlds.map(async (tld) => {
-      const domain = `${word}.${tld}`;
-      const resp = await client.send(
-        new CheckDomainAvailabilityCommand({ DomainName: domain }),
-      );
-      return {
-        domain,
-        tld,
-        status: resp.Availability ?? 'UNKNOWN',
-        price: priceByTld.get(tld) ?? null,
-      } satisfies BulkResultEntry;
-    }),
-  );
-
-  const results: BulkResultEntry[] = settled.map((s, i) =>
-    s.status === 'fulfilled'
-      ? s.value
-      : {
-          domain: `${word}.${tlds[i]}`,
-          tld: tlds[i],
-          status: 'ERROR',
-          price: priceByTld.get(tlds[i]) ?? null,
-        },
-  );
+  const results: BulkResultEntry[] = prices
+    .filter((p): p is PriceEntry & { Name: string } =>
+      typeof p.Name === 'string' && p.Name.length > 0,
+    )
+    .map((p) => ({
+      domain: `${word}.${p.Name}`,
+      tld: p.Name,
+      status: 'PENDING',
+      price: extractRegistrationPrice(p),
+    }));
 
   const body: BulkSuccessBody = {
     kind: 'bulk',
@@ -242,7 +202,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: parsed.error }, { status: 400 });
   }
 
-  if (!process.env.AWS_ROLE_ARN && process.env.VERCEL_OIDC_TOKEN !== undefined) {
+  if (!isOidcConfigured()) {
     return NextResponse.json(
       { error: 'AWS_ROLE_ARN is not configured' },
       { status: 500 },
