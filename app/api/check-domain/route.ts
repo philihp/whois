@@ -8,6 +8,7 @@ import * as R from 'ramda';
 import { parseInput } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
 import { isOidcConfigured, makeClient, toAwsErrorMessage } from '@/lib/aws';
+import { compareByPopularity } from '@/lib/popularity';
 
 type PriceShape = {
   amount: number;
@@ -163,12 +164,15 @@ const handleBulk = async (
     .filter((p): p is PriceEntry & { Name: string } =>
       typeof p.Name === 'string' && p.Name.length > 0,
     )
-    .map((p) => ({
-      domain: `${word}.${p.Name}`,
-      tld: p.Name,
-      status: 'PENDING',
-      price: extractRegistrationPrice(p),
-    }));
+    .map(
+      (p): BulkResultEntry => ({
+        domain: `${word}.${p.Name}`,
+        tld: p.Name,
+        status: 'PENDING',
+        price: extractRegistrationPrice(p),
+      }),
+    )
+    .sort((a, b) => compareByPopularity(a.tld, b.tld));
 
   const body: BulkSuccessBody = {
     kind: 'bulk',

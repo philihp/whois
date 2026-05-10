@@ -83,24 +83,13 @@ const toneToColor = (tone: Tone): string => {
   }
 };
 
-// Sort: available first, then other availables, then pending, then taken.
-const sortBulk = (entries: ReadonlyArray<BulkEntry>): BulkEntry[] => {
-  const rank = (s: string): number => {
-    if (s === 'AVAILABLE') return 0;
-    if (s.startsWith('AVAILABLE')) return 1;
-    if (s === 'PENDING') return 2;
-    return 3;
-  };
-  return [...entries].sort((a, b) => {
-    const r = rank(a.status) - rank(b.status);
-    return r !== 0 ? r : a.tld.localeCompare(b.tld);
-  });
-};
-
 // One in-flight per-TLD availability fetch at a time. The server runs them
 // serially with a 1s cooldown; sending more than one in parallel would just
 // keep Lambdas blocked in the server queue.
 const FANOUT_CONCURRENCY = 1;
+
+const isAbortError = (err: unknown): boolean =>
+  err instanceof DOMException && err.name === 'AbortError';
 
 export default function Home() {
   return (
@@ -124,7 +113,9 @@ function HomeContent() {
   const [throttleTotalMs, setThrottleTotalMs] = useState(0);
   const rafRef = useRef<number>(0);
   const lastFetchedRef = useRef<string | null>(null);
-  const fanoutAbortRef = useRef<AbortController | null>(null);
+  // Single controller for the whole query lifecycle (bulk fetch + per-TLD
+  // fanout). Abort it to stop all in-flight work for the current scan.
+  const queryAbortRef = useRef<AbortController | null>(null);
 
   const isThrottled = throttleEndsAt !== null;
 
@@ -150,62 +141,59 @@ function HomeContent() {
     setThrottleProgress(0);
   }, []);
 
-  const startFanout = useCallback((bulk: BulkResult) => {
-    fanoutAbortRef.current?.abort();
-    const ac = new AbortController();
-    fanoutAbortRef.current = ac;
+  const startFanout = useCallback(
+    (bulk: BulkResult, signal: AbortSignal) => {
+      // Server already returns results in popularity order; reuse it.
+      const queue = bulk.results.map((r) => r.domain);
 
-    const queue = bulk.results.map((r) => r.domain);
+      const updateRow = (domain: string, status: string) => {
+        setResult((prev) => {
+          if (!prev || prev.kind !== 'bulk') return prev;
+          return {
+            ...prev,
+            results: prev.results.map((r) =>
+              r.domain === domain ? { ...r, status } : r,
+            ),
+          };
+        });
+      };
 
-    const updateRow = (domain: string, status: string) => {
-      setResult((prev) => {
-        if (!prev || prev.kind !== 'bulk') return prev;
-        return {
-          ...prev,
-          results: prev.results.map((r) =>
-            r.domain === domain ? { ...r, status } : r,
-          ),
-        };
-      });
-    };
-
-    const worker = async () => {
-      while (!ac.signal.aborted) {
-        const domain = queue.shift();
-        if (!domain) return;
-        try {
-          const res = await fetch('/api/check-availability', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ domain }),
-            signal: ac.signal,
-          });
-          if (ac.signal.aborted) return;
-          if (!res.ok) {
+      const worker = async () => {
+        while (!signal.aborted) {
+          const domain = queue.shift();
+          if (!domain) return;
+          try {
+            const res = await fetch('/api/check-availability', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ domain }),
+              signal,
+            });
+            if (signal.aborted) return;
+            if (!res.ok) {
+              updateRow(domain, 'ERROR');
+              continue;
+            }
+            const data = (await res.json()) as AvailabilityResponse;
+            if (signal.aborted) return;
+            updateRow(domain, data.status ?? 'ERROR');
+          } catch (err) {
+            if (isAbortError(err)) return;
             updateRow(domain, 'ERROR');
-            continue;
           }
-          const data = (await res.json()) as AvailabilityResponse;
-          if (ac.signal.aborted) return;
-          updateRow(domain, data.status ?? 'ERROR');
-        } catch (err) {
-          if (
-            err instanceof DOMException &&
-            err.name === 'AbortError'
-          ) {
-            return;
-          }
-          updateRow(domain, 'ERROR');
         }
-      }
-    };
+      };
 
-    for (let i = 0; i < FANOUT_CONCURRENCY; i++) void worker();
-  }, []);
+      for (let i = 0; i < FANOUT_CONCURRENCY; i++) void worker();
+    },
+    [],
+  );
 
   const runQuery = useCallback(
     async (domain: string) => {
-      fanoutAbortRef.current?.abort();
+      queryAbortRef.current?.abort();
+      const ac = new AbortController();
+      queryAbortRef.current = ac;
       setLoading(true);
       setError(null);
       setResult(null);
@@ -214,8 +202,11 @@ function HomeContent() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ domain }),
+          signal: ac.signal,
         });
+        if (ac.signal.aborted) return;
         const data: unknown = await res.json();
+        if (ac.signal.aborted) return;
         if (res.status === 429 && isThrottleError(data)) {
           startThrottle(data.retryAfter);
         } else if (!res.ok) {
@@ -223,14 +214,15 @@ function HomeContent() {
         } else if (isCheckResult(data)) {
           setResult(data);
           startThrottle(data.throttleMs);
-          if (data.kind === 'bulk') startFanout(data);
+          if (data.kind === 'bulk') startFanout(data, ac.signal);
         } else {
           setError('Unexpected response.');
         }
-      } catch {
+      } catch (err) {
+        if (isAbortError(err)) return;
         setError('Network error. Try again.');
       } finally {
-        setLoading(false);
+        if (!ac.signal.aborted) setLoading(false);
       }
     },
     [startThrottle, startFanout],
@@ -240,7 +232,7 @@ function HomeContent() {
   useEffect(() => {
     setValue(domainParam);
     if (!domainParam) {
-      fanoutAbortRef.current?.abort();
+      queryAbortRef.current?.abort();
       setResult(null);
       setError(null);
       lastFetchedRef.current = null;
@@ -251,8 +243,21 @@ function HomeContent() {
     runQuery(domainParam);
   }, [domainParam, runQuery]);
 
-  // Cancel in-flight fanout on unmount.
-  useEffect(() => () => fanoutAbortRef.current?.abort(), []);
+  // Stop running queries when the user navigates away: route change /
+  // unmount via cleanup, and tab hidden / pagehide via these listeners.
+  useEffect(() => {
+    const stop = () => queryAbortRef.current?.abort();
+    const onVisibility = () => {
+      if (document.hidden) stop();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', stop);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', stop);
+      stop();
+    };
+  }, []);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -445,11 +450,12 @@ function SingleBlock({ result }: { result: SingleResult }) {
 }
 
 function BulkBlock({ result }: { result: BulkResult }) {
-  const sorted = sortBulk(result.results);
-  const total = sorted.length;
-  const pending = sorted.filter((r) => r.status === 'PENDING').length;
+  // Server returns results in popularity order — render as given.
+  const entries = result.results;
+  const total = entries.length;
+  const pending = entries.filter((r) => r.status === 'PENDING').length;
   const checked = total - pending;
-  const availableCount = sorted.filter((r) => r.status === 'AVAILABLE').length;
+  const availableCount = entries.filter((r) => r.status === 'AVAILABLE').length;
 
   return (
     <div style={{ animation: 'fadeIn 200ms ease-out' }}>
@@ -482,7 +488,7 @@ function BulkBlock({ result }: { result: BulkResult }) {
           borderTop: '1px solid rgba(0,0,0,0.1)',
         }}
       >
-        {sorted.map((entry) => {
+        {entries.map((entry) => {
           const label = statusLabel(entry.status);
           const toneColor = toneToColor(label.tone);
           return (

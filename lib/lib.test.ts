@@ -6,6 +6,7 @@ import {
   parseInput,
 } from './domain';
 import { getTld, pickPriceForDomain } from './pricing';
+import { compareByPopularity, tldRank } from './popularity';
 
 describe('normalizeDomain', () => {
   it('lowercases and trims', () => {
@@ -72,6 +73,21 @@ describe('getTld', () => {
   });
   it('returns trailing labels for compound domains', () => {
     expect(getTld('foo.bar.co.uk')).toBe('bar.co.uk');
+  });
+});
+
+describe('tldRank / compareByPopularity', () => {
+  it('ranks com before less popular TLDs', () => {
+    expect(tldRank('com')).toBeLessThan(tldRank('io'));
+    expect(tldRank('io')).toBeLessThan(tldRank('xyz'));
+  });
+  it('sends unlisted TLDs to the end', () => {
+    expect(tldRank('com')).toBeLessThan(tldRank('zzz'));
+    expect(tldRank('zzz')).toBe(tldRank('aaa'));
+  });
+  it('sorts a mixed list popularity-first, alphabetical otherwise', () => {
+    const sorted = ['xyz', 'aaa', 'com', 'io', 'bbb'].sort(compareByPopularity);
+    expect(sorted).toEqual(['com', 'io', 'xyz', 'aaa', 'bbb']);
   });
 });
 
