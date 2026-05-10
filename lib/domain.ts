@@ -21,16 +21,27 @@ const DOMAIN_RE =
 
 export const isValidDomain: (d: string) => boolean = R.test(DOMAIN_RE);
 
-export type ValidationResult =
-  | { ok: true; domain: string }
-  | { ok: false; error: string };
+// A single DNS label: 1-63 chars, alphanumeric with optional internal hyphens.
+const WORD_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-export const validate = (raw: unknown): ValidationResult => {
+export const isValidWord: (s: string) => boolean = R.test(WORD_RE);
+
+export type ParsedInput =
+  | { kind: 'domain'; domain: string }
+  | { kind: 'word'; word: string }
+  | { kind: 'error'; error: string };
+
+export const parseInput = (raw: unknown): ParsedInput => {
   if (typeof raw !== 'string' || raw.length === 0) {
-    return { ok: false, error: 'Please enter a domain name.' };
+    return { kind: 'error', error: 'Please enter a domain name.' };
   }
-  const domain = normalizeDomain(raw);
-  return isValidDomain(domain)
-    ? { ok: true, domain }
-    : { ok: false, error: 'That does not look like a valid domain name.' };
+  const value = normalizeDomain(raw);
+  if (!value.includes('.')) {
+    return isValidWord(value)
+      ? { kind: 'word', word: value }
+      : { kind: 'error', error: 'That does not look like a valid name.' };
+  }
+  return isValidDomain(value)
+    ? { kind: 'domain', domain: value }
+    : { kind: 'error', error: 'That does not look like a valid domain name.' };
 };

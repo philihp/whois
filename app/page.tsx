@@ -4,30 +4,55 @@ import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import * as R from 'ramda';
 
-type CheckResult = {
+type Price = { amount: number; currency: string } | null;
+
+type SingleResult = {
+  kind: 'single';
   domain: string;
   status: string;
-  price: { amount: number; currency: string } | null;
+  price: Price;
   throttleMs: number;
 };
+
+type BulkEntry = {
+  domain: string;
+  tld: string;
+  status: string;
+  price: Price;
+};
+
+type BulkResult = {
+  kind: 'bulk';
+  word: string;
+  results: BulkEntry[];
+  throttleMs: number;
+};
+
+type CheckResult = SingleResult | BulkResult;
 
 type ApiError = { error: string; detail?: string };
 
 type ThrottleErrorBody = { error: string; retryAfter: number };
 
-const isCheckResult = (v: unknown): v is CheckResult =>
-  R.has('status', v as object) &&
-  R.has('domain', v as object) &&
-  R.has('throttleMs', v as object);
+const isCheckResult = (v: unknown): v is CheckResult => {
+  if (!v || typeof v !== 'object') return false;
+  const kind = (v as { kind?: unknown }).kind;
+  return (
+    (kind === 'single' || kind === 'bulk') &&
+    R.has('throttleMs', v as object)
+  );
+};
 
 const isThrottleError = (v: unknown): v is ThrottleErrorBody =>
   R.has('retryAfter', v as object);
 
-const formatPrice = (p: CheckResult['price']): string =>
+const formatPrice = (p: Price): string =>
   p ? `${p.amount.toFixed(2)} ${p.currency}` : 'price unavailable';
 
-const statusLabel = (status: string): { text: string; tone: string } => {
-  const map: Record<string, { text: string; tone: string }> = {
+type Tone = 'available' | 'taken' | 'warn';
+
+const statusLabel = (status: string): { text: string; tone: Tone } => {
+  const map: Record<string, { text: string; tone: Tone }> = {
     AVAILABLE: { text: 'available', tone: 'available' },
     AVAILABLE_RESERVED: { text: 'reserved', tone: 'warn' },
     AVAILABLE_PREORDER: { text: 'preorder only', tone: 'warn' },
@@ -37,8 +62,26 @@ const statusLabel = (status: string): { text: string; tone: string } => {
     RESERVED: { text: 'reserved', tone: 'warn' },
     DONT_KNOW: { text: 'unknown — try again', tone: 'warn' },
     INVALID_NAME_FOR_TLD: { text: 'invalid for this TLD', tone: 'taken' },
+    ERROR: { text: 'lookup failed', tone: 'warn' },
   };
   return map[status] ?? { text: status.toLowerCase(), tone: 'warn' };
+};
+
+const toneToColor = (tone: Tone): string =>
+  tone === 'available'
+    ? 'var(--accent)'
+    : tone === 'taken'
+    ? 'var(--error)'
+    : 'var(--warn)';
+
+// Sort: available first, then by TLD alphabetically.
+const sortBulk = (entries: ReadonlyArray<BulkEntry>): BulkEntry[] => {
+  const rank = (s: string): number =>
+    s === 'AVAILABLE' ? 0 : s.startsWith('AVAILABLE') ? 1 : 2;
+  return [...entries].sort((a, b) => {
+    const r = rank(a.status) - rank(b.status);
+    return r !== 0 ? r : a.tld.localeCompare(b.tld);
+  });
 };
 
 export default function Home() {
@@ -194,7 +237,7 @@ function HomeContent() {
               type="text"
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              placeholder="example.com"
+              placeholder="example.com  or  example"
               autoFocus
               spellCheck={false}
               autoComplete="off"
@@ -229,9 +272,24 @@ function HomeContent() {
               {loading || isThrottled ? '…' : 'check'}
             </button>
           </div>
+          <p
+            style={{
+              marginTop: '0.5rem',
+              color: 'var(--muted)',
+              fontSize: '0.75rem',
+              letterSpacing: '0.05em',
+            }}
+          >
+            tip: enter a word without a dot to scan every TLD amazon offers.
+          </p>
         </form>
 
         <div style={{ minHeight: 120, marginTop: '2rem' }}>
+          {loading && (
+            <div style={{ color: 'var(--muted)', fontSize: '0.875rem' }}>
+              checking…
+            </div>
+          )}
           {error && (
             <div
               style={{
@@ -244,7 +302,8 @@ function HomeContent() {
               {error}
             </div>
           )}
-          {result && <ResultBlock result={result} />}
+          {result && result.kind === 'single' && <SingleBlock result={result} />}
+          {result && result.kind === 'bulk' && <BulkBlock result={result} />}
         </div>
 
         <footer
@@ -264,21 +323,12 @@ function HomeContent() {
   );
 }
 
-function ResultBlock({ result }: { result: CheckResult }) {
+function SingleBlock({ result }: { result: SingleResult }) {
   const label = statusLabel(result.status);
-  const toneColor =
-    label.tone === 'available'
-      ? 'var(--accent)'
-      : label.tone === 'taken'
-      ? 'var(--error)'
-      : 'var(--warn)';
+  const toneColor = toneToColor(label.tone);
 
   return (
-    <div
-      style={{
-        animation: 'fadeIn 200ms ease-out',
-      }}
-    >
+    <div style={{ animation: 'fadeIn 200ms ease-out' }}>
       <div
         style={{
           fontFamily: "'Fraunces', serif",
@@ -311,6 +361,81 @@ function ResultBlock({ result }: { result: CheckResult }) {
         <span style={{ color: 'var(--muted)' }}>—</span>
         <span style={{ fontSize: '0.875rem' }}>{formatPrice(result.price)}</span>
       </div>
+      <style>{`@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }`}</style>
+    </div>
+  );
+}
+
+function BulkBlock({ result }: { result: BulkResult }) {
+  const sorted = sortBulk(result.results);
+  const availableCount = sorted.filter((r) => r.status === 'AVAILABLE').length;
+
+  return (
+    <div style={{ animation: 'fadeIn 200ms ease-out' }}>
+      <div
+        style={{
+          fontFamily: "'Fraunces', serif",
+          fontSize: '1.5rem',
+          marginBottom: '0.25rem',
+          wordBreak: 'break-all',
+        }}
+      >
+        {result.word}
+      </div>
+      <div
+        style={{
+          color: 'var(--muted)',
+          fontSize: '0.75rem',
+          textTransform: 'uppercase',
+          letterSpacing: '0.1em',
+          marginBottom: '1rem',
+        }}
+      >
+        {availableCount} available · {sorted.length} TLDs scanned
+      </div>
+      <ul
+        style={{
+          listStyle: 'none',
+          padding: 0,
+          margin: 0,
+          borderTop: '1px solid rgba(0,0,0,0.1)',
+        }}
+      >
+        {sorted.map((entry) => {
+          const label = statusLabel(entry.status);
+          const toneColor = toneToColor(label.tone);
+          return (
+            <li
+              key={entry.tld}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr auto auto',
+                alignItems: 'baseline',
+                gap: '0.75rem',
+                padding: '0.5rem 0',
+                borderBottom: '1px solid rgba(0,0,0,0.06)',
+                fontSize: '0.875rem',
+              }}
+            >
+              <span style={{ wordBreak: 'break-all' }}>{entry.domain}</span>
+              <span
+                style={{
+                  color: toneColor,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.08em',
+                  fontSize: '0.75rem',
+                  fontWeight: 700,
+                }}
+              >
+                {label.text}
+              </span>
+              <span style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>
+                {formatPrice(entry.price)}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
       <style>{`@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }`}</style>
     </div>
   );

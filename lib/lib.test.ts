@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeDomain, isValidDomain, validate } from './domain';
+import {
+  normalizeDomain,
+  isValidDomain,
+  isValidWord,
+  parseInput,
+} from './domain';
 import { getTld, pickPriceForDomain } from './pricing';
 
 describe('normalizeDomain', () => {
@@ -23,18 +28,41 @@ describe('isValidDomain', () => {
   });
 });
 
-describe('validate', () => {
-  it('returns ok with normalized domain', () => {
-    expect(validate(' Example.com ')).toEqual({
-      ok: true,
+describe('isValidWord', () => {
+  it('accepts single labels', () => {
+    expect(isValidWord('example')).toBe(true);
+    expect(isValidWord('a')).toBe(true);
+    expect(isValidWord('foo-bar')).toBe(true);
+  });
+  it('rejects labels with dots, spaces, or edge hyphens', () => {
+    expect(isValidWord('example.com')).toBe(false);
+    expect(isValidWord('-bad')).toBe(false);
+    expect(isValidWord('bad-')).toBe(false);
+    expect(isValidWord('bad word')).toBe(false);
+  });
+});
+
+describe('parseInput', () => {
+  it('parses a full domain', () => {
+    expect(parseInput(' Example.com ')).toEqual({
+      kind: 'domain',
       domain: 'example.com',
     });
   });
-  it('returns error for non-string', () => {
-    expect(validate(undefined).ok).toBe(false);
+  it('parses a bare word as a bulk-scan request', () => {
+    expect(parseInput('Example')).toEqual({
+      kind: 'word',
+      word: 'example',
+    });
   });
-  it('returns error for invalid', () => {
-    expect(validate('nope').ok).toBe(false);
+  it('errors on non-string input', () => {
+    expect(parseInput(undefined).kind).toBe('error');
+  });
+  it('errors on invalid dotted input', () => {
+    expect(parseInput('-bad.com').kind).toBe('error');
+  });
+  it('errors on invalid bare word', () => {
+    expect(parseInput('-bad').kind).toBe('error');
   });
 });
 
