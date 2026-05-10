@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import * as R from 'ramda';
 
 type CheckResult = {
@@ -41,7 +42,19 @@ const statusLabel = (status: string): { text: string; tone: string } => {
 };
 
 export default function Home() {
-  const [value, setValue] = useState('');
+  return (
+    <Suspense fallback={null}>
+      <HomeContent />
+    </Suspense>
+  );
+}
+
+function HomeContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const domainParam = searchParams.get('domain') ?? '';
+
+  const [value, setValue] = useState(domainParam);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,6 +62,7 @@ export default function Home() {
   const [throttleEndsAt, setThrottleEndsAt] = useState<number | null>(null);
   const [throttleTotalMs, setThrottleTotalMs] = useState(0);
   const rafRef = useRef<number>(0);
+  const lastFetchedRef = useRef<string | null>(null);
 
   const isThrottled = throttleEndsAt !== null;
 
@@ -74,8 +88,7 @@ export default function Home() {
     setThrottleProgress(0);
   };
 
-  const onSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const runQuery = async (domain: string) => {
     setLoading(true);
     setError(null);
     setResult(null);
@@ -83,7 +96,7 @@ export default function Home() {
       const res = await fetch('/api/check-domain', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain: value }),
+        body: JSON.stringify({ domain }),
       });
       const data: unknown = await res.json();
       if (res.status === 429 && isThrottleError(data)) {
@@ -101,6 +114,33 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // URL is the source of truth: react to changes (initial load, back/forward).
+  useEffect(() => {
+    setValue(domainParam);
+    if (!domainParam) {
+      setResult(null);
+      setError(null);
+      lastFetchedRef.current = null;
+      return;
+    }
+    if (lastFetchedRef.current === domainParam) return;
+    lastFetchedRef.current = domainParam;
+    runQuery(domainParam);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [domainParam]);
+
+  const onSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    if (trimmed === domainParam) {
+      lastFetchedRef.current = trimmed;
+      runQuery(trimmed);
+      return;
+    }
+    router.push(`/?domain=${encodeURIComponent(trimmed)}`);
   };
 
   return (
