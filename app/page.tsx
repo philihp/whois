@@ -97,9 +97,10 @@ const sortBulk = (entries: ReadonlyArray<BulkEntry>): BulkEntry[] => {
   });
 };
 
-// Number of in-flight per-TLD availability fetches. Matches the server-side
-// global semaphore so we don't pile up queued requests at the edge.
-const FANOUT_CONCURRENCY = 4;
+// One in-flight per-TLD availability fetch at a time. The server runs them
+// serially with a 1s cooldown; sending more than one in parallel would just
+// keep Lambdas blocked in the server queue.
+const FANOUT_CONCURRENCY = 1;
 
 export default function Home() {
   return (

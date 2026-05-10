@@ -3,11 +3,12 @@ import { CheckDomainAvailabilityCommand } from '@aws-sdk/client-route-53-domains
 import * as R from 'ramda';
 import { parseInput } from '@/lib/domain';
 import { isOidcConfigured, makeClient, toAwsErrorMessage } from '@/lib/aws';
-import { Semaphore } from '@/lib/semaphore';
+import { SerialQueue } from '@/lib/rate-limit';
 
-// Module-level: caps in-flight CheckDomainAvailability calls per Lambda
-// instance. Sized to stay comfortably below AWS Route 53 Domains throttling.
-const awsConcurrency = new Semaphore(4);
+// Module-level: only one CheckDomainAvailability runs at a time, with a 1s
+// cooldown before the next can start. Sized to stay well under AWS Route 53
+// Domains throttling.
+const awsQueue = new SerialQueue(1000);
 
 type AvailabilityResponse = {
   domain: string;
@@ -37,7 +38,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const status = await awsConcurrency.run(async () => {
+    const status = await awsQueue.run(async () => {
       const client = makeClient();
       const resp = await client.send(
         new CheckDomainAvailabilityCommand({ DomainName: parsed.domain }),
