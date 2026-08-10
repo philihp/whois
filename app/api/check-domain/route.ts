@@ -4,39 +4,45 @@ import {
   CheckDomainAvailabilityCommand,
   ListPricesCommand,
 } from '@aws-sdk/client-route-53-domains';
-import { awsCredentialsProvider } from '@vercel/functions/oidc';
-import { fromEnv } from '@aws-sdk/credential-providers';
 import * as R from 'ramda';
-import { validate } from '@/lib/domain';
+import { parseInput } from '@/lib/domain';
 import { pickPriceForDomain } from '@/lib/pricing';
-
-// Route 53 Domains is only available in us-east-1.
-const region = 'us-east-1';
-
-// Use static key credentials locally when present; fall back to Vercel OIDC
-// in production (VERCEL_OIDC_TOKEN is fetched dynamically per-request by the
-// library, so it never appears as a static process.env var to check against).
-const makeClient = () =>
-  new Route53DomainsClient({
-    region,
-    credentials: process.env.AWS_ACCESS_KEY_ID
-      ? fromEnv()
-      : awsCredentialsProvider({ roleArn: process.env.AWS_ROLE_ARN! }),
-  });
+import { isOidcConfigured, makeClient, toAwsErrorMessage } from '@/lib/aws';
+import { compareByPopularity } from '@/lib/popularity';
 
 type PriceShape = {
   amount: number;
   currency: string;
 } | null;
 
+type PriceEntry = {
+  Name?: string;
+  RegistrationPrice?: { Price?: number; Currency?: string };
+};
+
 type ThrottleResult =
   | { throttled: false }
   | { throttled: true; retryAfter: number };
 
-type SuccessBody = {
+type BulkResultEntry = {
+  domain: string;
+  tld: string;
+  status: 'PENDING';
+  price: PriceShape;
+};
+
+type SingleSuccessBody = {
+  kind: 'single';
   domain: string;
   status: string;
   price: PriceShape;
+  throttleMs: number;
+};
+
+type BulkSuccessBody = {
+  kind: 'bulk';
+  word: string;
+  results: BulkResultEntry[];
   throttleMs: number;
 };
 
@@ -62,9 +68,6 @@ const setThrottleCookie = (response: NextResponse): void => {
   });
 };
 
-const toMessage = (err: unknown): string =>
-  err instanceof Error ? err.message : 'Unknown error from AWS';
-
 // Pure: pulls registration price out of the AWS price entry shape.
 const extractRegistrationPrice = (entry: unknown): PriceShape => {
   const price = R.path(['RegistrationPrice'], entry) as
@@ -72,6 +75,114 @@ const extractRegistrationPrice = (entry: unknown): PriceShape => {
     | undefined;
   if (!price || typeof price.Price !== 'number' || !price.Currency) return null;
   return { amount: price.Price, currency: price.Currency };
+};
+
+const getThrottleMs = (): number =>
+  parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
+
+const listAllTldPrices = async (
+  client: Route53DomainsClient,
+): Promise<PriceEntry[]> => {
+  const all: PriceEntry[] = [];
+  let marker: string | undefined;
+  do {
+    const resp = await client.send(
+      new ListPricesCommand({ Marker: marker, MaxItems: 100 }),
+    );
+    for (const p of resp.Prices ?? []) all.push(p as PriceEntry);
+    marker = resp.NextPageMarker;
+  } while (marker);
+  return all;
+};
+
+const handleSingle = async (
+  client: Route53DomainsClient,
+  domain: string,
+): Promise<NextResponse> => {
+  try {
+    const availability = await client.send(
+      new CheckDomainAvailabilityCommand({ DomainName: domain }),
+    );
+    const status = availability.Availability ?? 'UNKNOWN';
+
+    let price: PriceShape = null;
+    try {
+      const labels = domain.split('.');
+      const candidateTlds = R.range(1, labels.length).map((i) =>
+        labels.slice(i).join('.'),
+      );
+      for (const tld of candidateTlds) {
+        const resp = await client.send(new ListPricesCommand({ Tld: tld }));
+        const match = pickPriceForDomain(domain, resp.Prices ?? []);
+        if (match) {
+          price = extractRegistrationPrice(match);
+          if (price) break;
+        }
+      }
+    } catch {
+      // Pricing is optional; swallow and return availability only.
+    }
+
+    const body: SingleSuccessBody = {
+      kind: 'single',
+      domain,
+      status,
+      price,
+      throttleMs: getThrottleMs(),
+    };
+    const response = NextResponse.json(body);
+    setThrottleCookie(response);
+    return response;
+  } catch (err) {
+    const message = toAwsErrorMessage(err);
+    return NextResponse.json(
+      { error: `AWS error: ${message}`, detail: message },
+      { status: 502 },
+    );
+  }
+};
+
+// Bulk path returns the TLD list and prices but does NOT check availability.
+// Clients fan out per-TLD calls to /api/check-availability, which is globally
+// concurrency-limited to avoid AWS throttling.
+const handleBulk = async (
+  client: Route53DomainsClient,
+  word: string,
+): Promise<NextResponse> => {
+  let prices: PriceEntry[];
+  try {
+    prices = await listAllTldPrices(client);
+  } catch (err) {
+    const message = toAwsErrorMessage(err);
+    return NextResponse.json(
+      { error: `AWS error: ${message}`, detail: message },
+      { status: 502 },
+    );
+  }
+
+  const results: BulkResultEntry[] = prices
+    .filter((p): p is PriceEntry & { Name: string } =>
+      typeof p.Name === 'string' && p.Name.length > 0,
+    )
+    .map(
+      (p): BulkResultEntry => ({
+        domain: `${word}.${p.Name}`,
+        tld: p.Name,
+        status: 'PENDING',
+        price: extractRegistrationPrice(p),
+      }),
+    )
+    .sort((a, b) => compareByPopularity(a.tld, b.tld));
+
+  const body: BulkSuccessBody = {
+    kind: 'bulk',
+    word,
+    results,
+    throttleMs: getThrottleMs(),
+  };
+  const response = NextResponse.json(body);
+  setThrottleCookie(response);
+  return response;
 };
 
 export async function POST(req: NextRequest) {
@@ -90,13 +201,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const result = validate(R.path(['domain'], body));
-  if (!result.ok) {
-    return NextResponse.json({ error: result.error }, { status: 400 });
+  const parsed = parseInput(R.path(['domain'], body));
+  if (parsed.kind === 'error') {
+    return NextResponse.json({ error: parsed.error }, { status: 400 });
   }
-  const { domain } = result;
 
-  if (!process.env.AWS_ROLE_ARN && process.env.VERCEL_OIDC_TOKEN !== undefined) {
+  if (!isOidcConfigured()) {
     return NextResponse.json(
       { error: 'AWS_ROLE_ARN is not configured' },
       { status: 500 },
@@ -105,46 +215,7 @@ export async function POST(req: NextRequest) {
 
   const client = makeClient();
 
-  try {
-    // Availability check.
-    const availability = await client.send(
-      new CheckDomainAvailabilityCommand({ DomainName: domain }),
-    );
-    const status = availability.Availability ?? 'UNKNOWN';
-
-    // Price lookup is best-effort and runs in parallel-friendly fashion;
-    // failures here should not break the availability response.
-    let price: PriceShape = null;
-    try {
-      const labels = domain.split('.');
-      // Ask AWS only for the TLDs that could match this domain.
-      const candidateTlds = R.range(1, labels.length).map((i) =>
-        labels.slice(i).join('.'),
-      );
-      // ListPrices supports filtering by Tld (one at a time), so try the
-      // longest suffix first; fall back to shorter ones.
-      for (const tld of candidateTlds) {
-        const resp = await client.send(new ListPricesCommand({ Tld: tld }));
-        const match = pickPriceForDomain(domain, resp.Prices ?? []);
-        if (match) {
-          price = extractRegistrationPrice(match);
-          if (price) break;
-        }
-      }
-    } catch {
-      // Pricing is optional; swallow and return availability only.
-    }
-
-    const throttleMs = parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
-    const responseBody: SuccessBody = { domain, status, price, throttleMs };
-    const response = NextResponse.json(responseBody);
-    setThrottleCookie(response);
-    return response;
-  } catch (err) {
-    const message = toMessage(err);
-    return NextResponse.json(
-      { error: `AWS error: ${message}`, detail: message },
-      { status: 502 },
-    );
-  }
+  return parsed.kind === 'word'
+    ? handleBulk(client, parsed.word)
+    : handleSingle(client, parsed.domain);
 }

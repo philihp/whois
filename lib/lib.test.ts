@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeDomain, isValidDomain, validate } from './domain';
+import {
+  normalizeDomain,
+  isValidDomain,
+  isValidWord,
+  parseInput,
+} from './domain';
 import { getTld, pickPriceForDomain } from './pricing';
+import { compareByPopularity, tldRank } from './popularity';
 
 describe('normalizeDomain', () => {
   it('lowercases and trims', () => {
@@ -23,18 +29,41 @@ describe('isValidDomain', () => {
   });
 });
 
-describe('validate', () => {
-  it('returns ok with normalized domain', () => {
-    expect(validate(' Example.com ')).toEqual({
-      ok: true,
+describe('isValidWord', () => {
+  it('accepts single labels', () => {
+    expect(isValidWord('example')).toBe(true);
+    expect(isValidWord('a')).toBe(true);
+    expect(isValidWord('foo-bar')).toBe(true);
+  });
+  it('rejects labels with dots, spaces, or edge hyphens', () => {
+    expect(isValidWord('example.com')).toBe(false);
+    expect(isValidWord('-bad')).toBe(false);
+    expect(isValidWord('bad-')).toBe(false);
+    expect(isValidWord('bad word')).toBe(false);
+  });
+});
+
+describe('parseInput', () => {
+  it('parses a full domain', () => {
+    expect(parseInput(' Example.com ')).toEqual({
+      kind: 'domain',
       domain: 'example.com',
     });
   });
-  it('returns error for non-string', () => {
-    expect(validate(undefined).ok).toBe(false);
+  it('parses a bare word as a bulk-scan request', () => {
+    expect(parseInput('Example')).toEqual({
+      kind: 'word',
+      word: 'example',
+    });
   });
-  it('returns error for invalid', () => {
-    expect(validate('nope').ok).toBe(false);
+  it('errors on non-string input', () => {
+    expect(parseInput(undefined).kind).toBe('error');
+  });
+  it('errors on invalid dotted input', () => {
+    expect(parseInput('-bad.com').kind).toBe('error');
+  });
+  it('errors on invalid bare word', () => {
+    expect(parseInput('-bad').kind).toBe('error');
   });
 });
 
@@ -44,6 +73,21 @@ describe('getTld', () => {
   });
   it('returns trailing labels for compound domains', () => {
     expect(getTld('foo.bar.co.uk')).toBe('bar.co.uk');
+  });
+});
+
+describe('tldRank / compareByPopularity', () => {
+  it('ranks com before less popular TLDs', () => {
+    expect(tldRank('com')).toBeLessThan(tldRank('io'));
+    expect(tldRank('io')).toBeLessThan(tldRank('xyz'));
+  });
+  it('sends unlisted TLDs to the end', () => {
+    expect(tldRank('com')).toBeLessThan(tldRank('zzz'));
+    expect(tldRank('zzz')).toBe(tldRank('aaa'));
+  });
+  it('sorts a mixed list popularity-first, alphabetical otherwise', () => {
+    const sorted = ['xyz', 'aaa', 'com', 'io', 'bbb'].sort(compareByPopularity);
+    expect(sorted).toEqual(['com', 'io', 'xyz', 'aaa', 'bbb']);
   });
 });
 

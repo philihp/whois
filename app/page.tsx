@@ -4,30 +4,58 @@ import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import * as R from 'ramda';
 
-type CheckResult = {
+type Price = { amount: number; currency: string } | null;
+
+type SingleResult = {
+  kind: 'single';
   domain: string;
   status: string;
-  price: { amount: number; currency: string } | null;
+  price: Price;
   throttleMs: number;
 };
+
+type BulkEntry = {
+  domain: string;
+  tld: string;
+  status: string; // includes 'PENDING' until the per-TLD check resolves
+  price: Price;
+};
+
+type BulkResult = {
+  kind: 'bulk';
+  word: string;
+  results: BulkEntry[];
+  throttleMs: number;
+};
+
+type CheckResult = SingleResult | BulkResult;
 
 type ApiError = { error: string; detail?: string };
 
 type ThrottleErrorBody = { error: string; retryAfter: number };
 
-const isCheckResult = (v: unknown): v is CheckResult =>
-  R.has('status', v as object) &&
-  R.has('domain', v as object) &&
-  R.has('throttleMs', v as object);
+type AvailabilityResponse = { domain: string; status: string };
+
+const isCheckResult = (v: unknown): v is CheckResult => {
+  if (!v || typeof v !== 'object') return false;
+  const kind = (v as { kind?: unknown }).kind;
+  return (
+    (kind === 'single' || kind === 'bulk') &&
+    R.has('throttleMs', v as object)
+  );
+};
 
 const isThrottleError = (v: unknown): v is ThrottleErrorBody =>
   R.has('retryAfter', v as object);
 
-const formatPrice = (p: CheckResult['price']): string =>
+const formatPrice = (p: Price): string =>
   p ? `${p.amount.toFixed(2)} ${p.currency}` : 'price unavailable';
 
-const statusLabel = (status: string): { text: string; tone: string } => {
-  const map: Record<string, { text: string; tone: string }> = {
+type Tone = 'available' | 'taken' | 'warn' | 'pending';
+
+const statusLabel = (status: string): { text: string; tone: Tone } => {
+  const map: Record<string, { text: string; tone: Tone }> = {
+    PENDING: { text: 'checking…', tone: 'pending' },
     AVAILABLE: { text: 'available', tone: 'available' },
     AVAILABLE_RESERVED: { text: 'reserved', tone: 'warn' },
     AVAILABLE_PREORDER: { text: 'preorder only', tone: 'warn' },
@@ -37,9 +65,31 @@ const statusLabel = (status: string): { text: string; tone: string } => {
     RESERVED: { text: 'reserved', tone: 'warn' },
     DONT_KNOW: { text: 'unknown — try again', tone: 'warn' },
     INVALID_NAME_FOR_TLD: { text: 'invalid for this TLD', tone: 'taken' },
+    ERROR: { text: 'lookup failed', tone: 'warn' },
   };
   return map[status] ?? { text: status.toLowerCase(), tone: 'warn' };
 };
+
+const toneToColor = (tone: Tone): string => {
+  switch (tone) {
+    case 'available':
+      return 'var(--accent)';
+    case 'taken':
+      return 'var(--error)';
+    case 'warn':
+      return 'var(--warn)';
+    case 'pending':
+      return 'var(--muted)';
+  }
+};
+
+// One in-flight per-TLD availability fetch at a time. The server runs them
+// serially with a 1s cooldown; sending more than one in parallel would just
+// keep Lambdas blocked in the server queue.
+const FANOUT_CONCURRENCY = 1;
+
+const isAbortError = (err: unknown): boolean =>
+  err instanceof DOMException && err.name === 'AbortError';
 
 export default function Home() {
   return (
@@ -63,6 +113,9 @@ function HomeContent() {
   const [throttleTotalMs, setThrottleTotalMs] = useState(0);
   const rafRef = useRef<number>(0);
   const lastFetchedRef = useRef<string | null>(null);
+  // Single controller for the whole query lifecycle (bulk fetch + per-TLD
+  // fanout). Abort it to stop all in-flight work for the current scan.
+  const queryAbortRef = useRef<AbortController | null>(null);
 
   const isThrottled = throttleEndsAt !== null;
 
@@ -88,8 +141,59 @@ function HomeContent() {
     setThrottleProgress(0);
   }, []);
 
+  const startFanout = useCallback(
+    (bulk: BulkResult, signal: AbortSignal) => {
+      // Server already returns results in popularity order; reuse it.
+      const queue = bulk.results.map((r) => r.domain);
+
+      const updateRow = (domain: string, status: string) => {
+        setResult((prev) => {
+          if (!prev || prev.kind !== 'bulk') return prev;
+          return {
+            ...prev,
+            results: prev.results.map((r) =>
+              r.domain === domain ? { ...r, status } : r,
+            ),
+          };
+        });
+      };
+
+      const worker = async () => {
+        while (!signal.aborted) {
+          const domain = queue.shift();
+          if (!domain) return;
+          try {
+            const res = await fetch('/api/check-availability', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ domain }),
+              signal,
+            });
+            if (signal.aborted) return;
+            if (!res.ok) {
+              updateRow(domain, 'ERROR');
+              continue;
+            }
+            const data = (await res.json()) as AvailabilityResponse;
+            if (signal.aborted) return;
+            updateRow(domain, data.status ?? 'ERROR');
+          } catch (err) {
+            if (isAbortError(err)) return;
+            updateRow(domain, 'ERROR');
+          }
+        }
+      };
+
+      for (let i = 0; i < FANOUT_CONCURRENCY; i++) void worker();
+    },
+    [],
+  );
+
   const runQuery = useCallback(
     async (domain: string) => {
+      queryAbortRef.current?.abort();
+      const ac = new AbortController();
+      queryAbortRef.current = ac;
       setLoading(true);
       setError(null);
       setResult(null);
@@ -98,8 +202,11 @@ function HomeContent() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ domain }),
+          signal: ac.signal,
         });
+        if (ac.signal.aborted) return;
         const data: unknown = await res.json();
+        if (ac.signal.aborted) return;
         if (res.status === 429 && isThrottleError(data)) {
           startThrottle(data.retryAfter);
         } else if (!res.ok) {
@@ -107,22 +214,25 @@ function HomeContent() {
         } else if (isCheckResult(data)) {
           setResult(data);
           startThrottle(data.throttleMs);
+          if (data.kind === 'bulk') startFanout(data, ac.signal);
         } else {
           setError('Unexpected response.');
         }
-      } catch {
+      } catch (err) {
+        if (isAbortError(err)) return;
         setError('Network error. Try again.');
       } finally {
-        setLoading(false);
+        if (!ac.signal.aborted) setLoading(false);
       }
     },
-    [startThrottle],
+    [startThrottle, startFanout],
   );
 
   // URL is the source of truth: react to changes (initial load, back/forward).
   useEffect(() => {
     setValue(domainParam);
     if (!domainParam) {
+      queryAbortRef.current?.abort();
       setResult(null);
       setError(null);
       lastFetchedRef.current = null;
@@ -132,6 +242,22 @@ function HomeContent() {
     lastFetchedRef.current = domainParam;
     runQuery(domainParam);
   }, [domainParam, runQuery]);
+
+  // Stop running queries when the user navigates away: route change /
+  // unmount via cleanup, and tab hidden / pagehide via these listeners.
+  useEffect(() => {
+    const stop = () => queryAbortRef.current?.abort();
+    const onVisibility = () => {
+      if (document.hidden) stop();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', stop);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', stop);
+      stop();
+    };
+  }, []);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -194,7 +320,7 @@ function HomeContent() {
               type="text"
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              placeholder="example.com"
+              placeholder="example.com  or  example"
               autoFocus
               spellCheck={false}
               autoComplete="off"
@@ -229,9 +355,24 @@ function HomeContent() {
               {loading || isThrottled ? '…' : 'check'}
             </button>
           </div>
+          <p
+            style={{
+              marginTop: '0.5rem',
+              color: 'var(--muted)',
+              fontSize: '0.75rem',
+              letterSpacing: '0.05em',
+            }}
+          >
+            tip: enter a word without a dot to scan every TLD amazon offers.
+          </p>
         </form>
 
         <div style={{ minHeight: 120, marginTop: '2rem' }}>
+          {loading && (
+            <div style={{ color: 'var(--muted)', fontSize: '0.875rem' }}>
+              checking…
+            </div>
+          )}
           {error && (
             <div
               style={{
@@ -244,7 +385,8 @@ function HomeContent() {
               {error}
             </div>
           )}
-          {result && <ResultBlock result={result} />}
+          {result && result.kind === 'single' && <SingleBlock result={result} />}
+          {result && result.kind === 'bulk' && <BulkBlock result={result} />}
         </div>
 
         <footer
@@ -264,21 +406,12 @@ function HomeContent() {
   );
 }
 
-function ResultBlock({ result }: { result: CheckResult }) {
+function SingleBlock({ result }: { result: SingleResult }) {
   const label = statusLabel(result.status);
-  const toneColor =
-    label.tone === 'available'
-      ? 'var(--accent)'
-      : label.tone === 'taken'
-      ? 'var(--error)'
-      : 'var(--warn)';
+  const toneColor = toneToColor(label.tone);
 
   return (
-    <div
-      style={{
-        animation: 'fadeIn 200ms ease-out',
-      }}
-    >
+    <div style={{ animation: 'fadeIn 200ms ease-out' }}>
       <div
         style={{
           fontFamily: "'Fraunces', serif",
@@ -311,6 +444,87 @@ function ResultBlock({ result }: { result: CheckResult }) {
         <span style={{ color: 'var(--muted)' }}>—</span>
         <span style={{ fontSize: '0.875rem' }}>{formatPrice(result.price)}</span>
       </div>
+      <style>{`@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }`}</style>
+    </div>
+  );
+}
+
+function BulkBlock({ result }: { result: BulkResult }) {
+  // Server returns results in popularity order — render as given.
+  const entries = result.results;
+  const total = entries.length;
+  const pending = entries.filter((r) => r.status === 'PENDING').length;
+  const checked = total - pending;
+  const availableCount = entries.filter((r) => r.status === 'AVAILABLE').length;
+
+  return (
+    <div style={{ animation: 'fadeIn 200ms ease-out' }}>
+      <div
+        style={{
+          fontFamily: "'Fraunces', serif",
+          fontSize: '1.5rem',
+          marginBottom: '0.25rem',
+          wordBreak: 'break-all',
+        }}
+      >
+        {result.word}
+      </div>
+      <div
+        style={{
+          color: 'var(--muted)',
+          fontSize: '0.75rem',
+          textTransform: 'uppercase',
+          letterSpacing: '0.1em',
+          marginBottom: '1rem',
+        }}
+      >
+        {availableCount} available · {checked} of {total} checked
+      </div>
+      <ul
+        style={{
+          listStyle: 'none',
+          padding: 0,
+          margin: 0,
+          borderTop: '1px solid rgba(0,0,0,0.1)',
+        }}
+      >
+        {entries.map((entry) => {
+          const label = statusLabel(entry.status);
+          const toneColor = toneToColor(label.tone);
+          return (
+            <li
+              key={entry.tld}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr auto auto',
+                alignItems: 'baseline',
+                gap: '0.75rem',
+                padding: '0.5rem 0',
+                borderBottom: '1px solid rgba(0,0,0,0.06)',
+                fontSize: '0.875rem',
+                opacity: entry.status === 'PENDING' ? 0.55 : 1,
+                transition: 'opacity 200ms',
+              }}
+            >
+              <span style={{ wordBreak: 'break-all' }}>{entry.domain}</span>
+              <span
+                style={{
+                  color: toneColor,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.08em',
+                  fontSize: '0.75rem',
+                  fontWeight: 700,
+                }}
+              >
+                {label.text}
+              </span>
+              <span style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>
+                {formatPrice(entry.price)}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
       <style>{`@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }`}</style>
     </div>
   );
