@@ -4,10 +4,11 @@ Minimal Next.js app that checks domain availability and registration price using
 
 ## Stack
 
-- Next.js 14 (App Router) + TypeScript
+- Next.js 16 (App Router, Turbopack) + TypeScript 7
 - AWS SDK v3 (`@aws-sdk/client-route-53-domains`)
 - Ramda for the pure helpers
 - Vitest for tests
+- oxlint for linting
 - GitHub Actions for CI (lint · typecheck · test · build)
 - Vercel for hosting + deploy
 
