@@ -37,31 +37,32 @@ const setThrottleCookie = (response: NextResponse): void => {
 
 // Emits the meta line immediately, then everything the workflow writes to its
 // run stream. The client gets rows as the parallel steps resolve.
+//
+// Uses pipeTo rather than a manual reader loop: when the client disconnects, the
+// readable is cancelled, which errors the transform's writable and aborts the
+// source. Cancelling a stream a reader still holds a lock on throws
+// "Invalid state: ReadableStream is locked".
 const ndjson = (
   meta: MetaMessage,
   workflowStream: ReadableStream<Uint8Array>,
-): ReadableStream<Uint8Array> =>
-  new ReadableStream<Uint8Array>({
-    async start(controller) {
-      controller.enqueue(encodeMessage(meta));
-      const reader = workflowStream.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) controller.enqueue(value);
-        }
-        controller.close();
-      } catch (err) {
-        controller.error(err);
-      } finally {
-        reader.releaseLock();
-      }
-    },
-    cancel() {
-      return workflowStream.cancel();
-    },
+): ReadableStream<Uint8Array> => {
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+
+  void (async () => {
+    const writer = writable.getWriter();
+    try {
+      await writer.write(encodeMessage(meta));
+    } finally {
+      writer.releaseLock();
+    }
+    await workflowStream.pipeTo(writable);
+  })().catch(() => {
+    // Client hung up, or the run stream failed. Either way the response is
+    // already torn down; nothing left to report here.
   });
+
+  return readable;
+};
 
 export async function POST(req: NextRequest) {
   const throttle = checkThrottle(req);
