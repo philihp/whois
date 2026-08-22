@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "app/api/check-domain/route.ts": {
+      "supportsCancellation": true,
+      "maxDuration": 300
+    }
+  }
+}
