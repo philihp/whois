@@ -3,29 +3,24 @@
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import * as R from 'ramda';
-
-type Price = { amount: number; currency: string } | null;
+import type { Price, ScanMessage, TldEntry } from '@/lib/protocol';
+import { parseMessage, splitLines } from '@/lib/protocol';
 
 type SingleResult = {
   kind: 'single';
   domain: string;
   status: string;
   price: Price;
-  throttleMs: number;
 };
 
-type BulkEntry = {
-  domain: string;
-  tld: string;
-  status: string; // includes 'PENDING' until the per-TLD check resolves
-  price: Price;
+type BulkEntry = TldEntry & {
+  status: string; // 'PENDING' until the parallel workflow step resolves
 };
 
 type BulkResult = {
   kind: 'bulk';
   word: string;
   results: BulkEntry[];
-  throttleMs: number;
 };
 
 type CheckResult = SingleResult | BulkResult;
@@ -33,17 +28,6 @@ type CheckResult = SingleResult | BulkResult;
 type ApiError = { error: string; detail?: string };
 
 type ThrottleErrorBody = { error: string; retryAfter: number };
-
-type AvailabilityResponse = { domain: string; status: string };
-
-const isCheckResult = (v: unknown): v is CheckResult => {
-  if (!v || typeof v !== 'object') return false;
-  const kind = (v as { kind?: unknown }).kind;
-  return (
-    (kind === 'single' || kind === 'bulk') &&
-    R.has('throttleMs', v as object)
-  );
-};
 
 const isThrottleError = (v: unknown): v is ThrottleErrorBody =>
   R.has('retryAfter', v as object);
@@ -83,11 +67,6 @@ const toneToColor = (tone: Tone): string => {
   }
 };
 
-// One in-flight per-TLD availability fetch at a time. The server runs them
-// serially with a 1s cooldown; sending more than one in parallel would just
-// keep Lambdas blocked in the server queue.
-const FANOUT_CONCURRENCY = 1;
-
 const isAbortError = (err: unknown): boolean =>
   err instanceof DOMException && err.name === 'AbortError';
 
@@ -113,8 +92,8 @@ function HomeContent() {
   const [throttleTotalMs, setThrottleTotalMs] = useState(0);
   const rafRef = useRef<number>(0);
   const lastFetchedRef = useRef<string | null>(null);
-  // Single controller for the whole query lifecycle (bulk fetch + per-TLD
-  // fanout). Abort it to stop all in-flight work for the current scan.
+  // Single controller for the whole query lifecycle. Aborting it drops the
+  // NDJSON stream, which cancels the route and stops the scan server-side.
   const queryAbortRef = useRef<AbortController | null>(null);
 
   const isThrottled = throttleEndsAt !== null;
@@ -141,54 +120,6 @@ function HomeContent() {
     setThrottleProgress(0);
   }, []);
 
-  const startFanout = useCallback(
-    (bulk: BulkResult, signal: AbortSignal) => {
-      // Server already returns results in popularity order; reuse it.
-      const queue = bulk.results.map((r) => r.domain);
-
-      const updateRow = (domain: string, status: string) => {
-        setResult((prev) => {
-          if (!prev || prev.kind !== 'bulk') return prev;
-          return {
-            ...prev,
-            results: prev.results.map((r) =>
-              r.domain === domain ? { ...r, status } : r,
-            ),
-          };
-        });
-      };
-
-      const worker = async () => {
-        while (!signal.aborted) {
-          const domain = queue.shift();
-          if (!domain) return;
-          try {
-            const res = await fetch('/api/check-availability', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ domain }),
-              signal,
-            });
-            if (signal.aborted) return;
-            if (!res.ok) {
-              updateRow(domain, 'ERROR');
-              continue;
-            }
-            const data = (await res.json()) as AvailabilityResponse;
-            if (signal.aborted) return;
-            updateRow(domain, data.status ?? 'ERROR');
-          } catch (err) {
-            if (isAbortError(err)) return;
-            updateRow(domain, 'ERROR');
-          }
-        }
-      };
-
-      for (let i = 0; i < FANOUT_CONCURRENCY; i++) void worker();
-    },
-    [],
-  );
-
   const runQuery = useCallback(
     async (domain: string) => {
       queryAbortRef.current?.abort();
@@ -197,6 +128,47 @@ function HomeContent() {
       setLoading(true);
       setError(null);
       setResult(null);
+
+      // Rows arrive one message at a time, out of order, as each parallel
+      // workflow step resolves. Fold each message into the current result.
+      const apply = (msg: ScanMessage) => {
+        switch (msg.type) {
+          case 'meta':
+            startThrottle(msg.throttleMs);
+            break;
+          case 'tlds':
+            setResult({
+              kind: 'bulk',
+              word: msg.word,
+              results: msg.entries.map((e) => ({ ...e, status: 'PENDING' })),
+            });
+            break;
+          case 'status':
+            setResult((prev) =>
+              prev && prev.kind === 'bulk'
+                ? {
+                    ...prev,
+                    results: prev.results.map((r) =>
+                      r.domain === msg.domain ? { ...r, status: msg.status } : r,
+                    ),
+                  }
+                : prev,
+            );
+            break;
+          case 'single':
+            setResult({
+              kind: 'single',
+              domain: msg.domain,
+              status: msg.status,
+              price: msg.price,
+            });
+            break;
+          case 'error':
+            setError(msg.error);
+            break;
+        }
+      };
+
       try {
         const res = await fetch('/api/check-domain', {
           method: 'POST',
@@ -205,19 +177,40 @@ function HomeContent() {
           signal: ac.signal,
         });
         if (ac.signal.aborted) return;
-        const data: unknown = await res.json();
-        if (ac.signal.aborted) return;
-        if (res.status === 429 && isThrottleError(data)) {
-          startThrottle(data.retryAfter);
-        } else if (!res.ok) {
-          setError((data as ApiError).error ?? 'Something went wrong.');
-        } else if (isCheckResult(data)) {
-          setResult(data);
-          startThrottle(data.throttleMs);
-          if (data.kind === 'bulk') startFanout(data, ac.signal);
-        } else {
-          setError('Unexpected response.');
+
+        // Errors (throttle, validation, config) still come back as plain JSON.
+        if (!res.ok) {
+          const data: unknown = await res.json().catch(() => null);
+          if (res.status === 429 && isThrottleError(data)) {
+            startThrottle(data.retryAfter);
+          } else {
+            setError((data as ApiError | null)?.error ?? 'Something went wrong.');
+          }
+          return;
         }
+
+        if (!res.body) {
+          setError('Unexpected response.');
+          return;
+        }
+
+        // The first message lands quickly; keep the spinner only until then.
+        const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+        let buffer = '';
+        for (;;) {
+          const { done, value: chunk } = await reader.read();
+          if (done) break;
+          buffer += chunk;
+          const { lines, rest } = splitLines(buffer);
+          buffer = rest;
+          for (const line of lines) {
+            const msg = parseMessage(line);
+            if (msg) apply(msg);
+          }
+          setLoading(false);
+        }
+        const trailing = parseMessage(buffer.trim());
+        if (trailing) apply(trailing);
       } catch (err) {
         if (isAbortError(err)) return;
         setError('Network error. Try again.');
@@ -225,7 +218,7 @@ function HomeContent() {
         if (!ac.signal.aborted) setLoading(false);
       }
     },
-    [startThrottle, startFanout],
+    [startThrottle],
   );
 
   // URL is the source of truth: react to changes (initial load, back/forward).

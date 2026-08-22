@@ -21,3 +21,19 @@ export const isOidcConfigured = (): boolean =>
 
 export const toAwsErrorMessage = (err: unknown): string =>
   err instanceof Error ? err.message : 'Unknown error from AWS';
+
+// Route 53 Domains rejects bursts with a throttling error; those are worth
+// retrying with backoff, unlike validation or auth failures.
+export const isThrottlingError = (err: unknown): boolean => {
+  if (!err || typeof err !== 'object') return false;
+  const name = (err as { name?: unknown }).name;
+  const status = (
+    err as { $metadata?: { httpStatusCode?: number } }
+  ).$metadata?.httpStatusCode;
+  return (
+    status === 429 ||
+    name === 'ThrottlingException' ||
+    name === 'TooManyRequestsException' ||
+    name === 'RequestLimitExceeded'
+  );
+};
