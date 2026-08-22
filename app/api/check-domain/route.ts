@@ -6,6 +6,11 @@ import { isOidcConfigured } from '@/lib/aws';
 import { encodeMessage, type MetaMessage } from '@/lib/protocol';
 import { checkDomainWorkflow, scanWordWorkflow } from '@/workflows/domain-scan';
 
+// Next.js App Router reads maxDuration from a route segment export; the
+// `functions` glob in vercel.json does not reliably apply to it. Without this the
+// route died at the 120s default mid-scan and truncated the stream.
+export const maxDuration = 300;
+
 type ThrottleResult =
   | { throttled: false }
   | { throttled: true; retryAfter: number };
