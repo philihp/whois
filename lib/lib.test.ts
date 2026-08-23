@@ -7,8 +7,6 @@ import {
 } from './domain';
 import { getTld, pickPriceForDomain } from './pricing';
 import { compareByPopularity, tldRank } from './popularity';
-import { encodeMessage, parseMessage, splitLines } from './protocol';
-import { isThrottlingError } from './aws';
 
 describe('normalizeDomain', () => {
   it('lowercases and trims', () => {
@@ -107,65 +105,5 @@ describe('pickPriceForDomain', () => {
   });
   it('returns undefined when no match', () => {
     expect(pickPriceForDomain('example.zzz', prices)).toBeUndefined();
-  });
-});
-
-describe('splitLines', () => {
-  it('returns whole lines and keeps the partial tail', () => {
-    expect(splitLines('{"a":1}\n{"b":2}\n{"c":')).toEqual({
-      lines: ['{"a":1}', '{"b":2}'],
-      rest: '{"c":',
-    });
-  });
-  it('returns no lines when nothing is complete yet', () => {
-    expect(splitLines('{"a"')).toEqual({ lines: [], rest: '{"a"' });
-  });
-  it('drops blank lines', () => {
-    expect(splitLines('{"a":1}\n\n\n').lines).toEqual(['{"a":1}']);
-  });
-});
-
-describe('parseMessage', () => {
-  it('parses a typed message', () => {
-    expect(parseMessage('{"type":"status","domain":"a.com","status":"AVAILABLE"}')).toEqual({
-      type: 'status',
-      domain: 'a.com',
-      status: 'AVAILABLE',
-    });
-  });
-  it('returns null on malformed JSON', () => {
-    expect(parseMessage('{"type":')).toBeNull();
-  });
-  it('returns null when the type discriminator is missing', () => {
-    expect(parseMessage('{"domain":"a.com"}')).toBeNull();
-  });
-});
-
-describe('encodeMessage', () => {
-  it('emits one newline-terminated JSON line', () => {
-    const text = new TextDecoder().decode(
-      encodeMessage({ type: 'meta', kind: 'bulk', throttleMs: 5000 }),
-    );
-    expect(text.endsWith('\n')).toBe(true);
-    expect(parseMessage(text.trim())).toEqual({
-      type: 'meta',
-      kind: 'bulk',
-      throttleMs: 5000,
-    });
-  });
-});
-
-describe('isThrottlingError', () => {
-  it('detects AWS throttling by error name', () => {
-    expect(isThrottlingError({ name: 'ThrottlingException' })).toBe(true);
-    expect(isThrottlingError({ name: 'TooManyRequestsException' })).toBe(true);
-  });
-  it('detects throttling by HTTP status', () => {
-    expect(isThrottlingError({ $metadata: { httpStatusCode: 429 } })).toBe(true);
-  });
-  it('ignores other failures', () => {
-    expect(isThrottlingError(new Error('boom'))).toBe(false);
-    expect(isThrottlingError({ name: 'AccessDeniedException' })).toBe(false);
-    expect(isThrottlingError(null)).toBe(false);
   });
 });

@@ -1,22 +1,55 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { start } from 'workflow/api';
+import {
+  Route53DomainsClient,
+  CheckDomainAvailabilityCommand,
+  ListPricesCommand,
+} from '@aws-sdk/client-route-53-domains';
 import * as R from 'ramda';
 import { parseInput } from '@/lib/domain';
-import { isOidcConfigured } from '@/lib/aws';
-import { encodeMessage, type MetaMessage } from '@/lib/protocol';
-import { checkDomainWorkflow, scanWordWorkflow } from '@/workflows/domain-scan';
+import { pickPriceForDomain } from '@/lib/pricing';
+import { isOidcConfigured, makeClient, toAwsErrorMessage } from '@/lib/aws';
+import { compareByPopularity } from '@/lib/popularity';
+
+type PriceShape = {
+  amount: number;
+  currency: string;
+} | null;
+
+type PriceEntry = {
+  Name?: string;
+  RegistrationPrice?: { Price?: number; Currency?: string };
+};
 
 type ThrottleResult =
   | { throttled: false }
   | { throttled: true; retryAfter: number };
 
+type BulkResultEntry = {
+  domain: string;
+  tld: string;
+  status: 'PENDING';
+  price: PriceShape;
+};
+
+type SingleSuccessBody = {
+  kind: 'single';
+  domain: string;
+  status: string;
+  price: PriceShape;
+  throttleMs: number;
+};
+
+type BulkSuccessBody = {
+  kind: 'bulk';
+  word: string;
+  results: BulkResultEntry[];
+  throttleMs: number;
+};
+
 const THROTTLE_COOKIE = 'last_check';
 
-const getThrottleMs = (): number =>
-  parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
-
 const checkThrottle = (req: NextRequest): ThrottleResult => {
-  const throttleMs = getThrottleMs();
+  const throttleMs = parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
   const raw = req.cookies.get(THROTTLE_COOKIE)?.value;
   if (!raw) return { throttled: false };
   const lastCheck = parseInt(raw, 10);
@@ -35,42 +68,128 @@ const setThrottleCookie = (response: NextResponse): void => {
   });
 };
 
-// Emits the meta line immediately, then everything the workflow writes to its
-// run stream. The client gets rows as the parallel steps resolve.
-const ndjson = (
-  meta: MetaMessage,
-  workflowStream: ReadableStream<Uint8Array>,
-): ReadableStream<Uint8Array> =>
-  new ReadableStream<Uint8Array>({
-    async start(controller) {
-      controller.enqueue(encodeMessage(meta));
-      const reader = workflowStream.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) controller.enqueue(value);
+// Pure: pulls registration price out of the AWS price entry shape.
+const extractRegistrationPrice = (entry: unknown): PriceShape => {
+  const price = R.path(['RegistrationPrice'], entry) as
+    | { Price?: number; Currency?: string }
+    | undefined;
+  if (!price || typeof price.Price !== 'number' || !price.Currency) return null;
+  return { amount: price.Price, currency: price.Currency };
+};
+
+const getThrottleMs = (): number =>
+  parseInt(process.env.THROTTLE_SECONDS ?? '5', 10) * 1000;
+
+const listAllTldPrices = async (
+  client: Route53DomainsClient,
+): Promise<PriceEntry[]> => {
+  const all: PriceEntry[] = [];
+  let marker: string | undefined;
+  do {
+    const resp = await client.send(
+      new ListPricesCommand({ Marker: marker, MaxItems: 100 }),
+    );
+    for (const p of resp.Prices ?? []) all.push(p as PriceEntry);
+    marker = resp.NextPageMarker;
+  } while (marker);
+  return all;
+};
+
+const handleSingle = async (
+  client: Route53DomainsClient,
+  domain: string,
+): Promise<NextResponse> => {
+  try {
+    const availability = await client.send(
+      new CheckDomainAvailabilityCommand({ DomainName: domain }),
+    );
+    const status = availability.Availability ?? 'UNKNOWN';
+
+    let price: PriceShape = null;
+    try {
+      const labels = domain.split('.');
+      const candidateTlds = R.range(1, labels.length).map((i) =>
+        labels.slice(i).join('.'),
+      );
+      for (const tld of candidateTlds) {
+        const resp = await client.send(new ListPricesCommand({ Tld: tld }));
+        const match = pickPriceForDomain(domain, resp.Prices ?? []);
+        if (match) {
+          price = extractRegistrationPrice(match);
+          if (price) break;
         }
-        controller.close();
-      } catch (err) {
-        controller.error(err);
-      } finally {
-        reader.releaseLock();
       }
-    },
-    cancel() {
-      return workflowStream.cancel();
-    },
-  });
+    } catch {
+      // Pricing is optional; swallow and return availability only.
+    }
+
+    const body: SingleSuccessBody = {
+      kind: 'single',
+      domain,
+      status,
+      price,
+      throttleMs: getThrottleMs(),
+    };
+    const response = NextResponse.json(body);
+    setThrottleCookie(response);
+    return response;
+  } catch (err) {
+    const message = toAwsErrorMessage(err);
+    return NextResponse.json(
+      { error: `AWS error: ${message}`, detail: message },
+      { status: 502 },
+    );
+  }
+};
+
+// Bulk path returns the TLD list and prices but does NOT check availability.
+// Clients fan out per-TLD calls to /api/check-availability, which is globally
+// concurrency-limited to avoid AWS throttling.
+const handleBulk = async (
+  client: Route53DomainsClient,
+  word: string,
+): Promise<NextResponse> => {
+  let prices: PriceEntry[];
+  try {
+    prices = await listAllTldPrices(client);
+  } catch (err) {
+    const message = toAwsErrorMessage(err);
+    return NextResponse.json(
+      { error: `AWS error: ${message}`, detail: message },
+      { status: 502 },
+    );
+  }
+
+  const results: BulkResultEntry[] = prices
+    .filter((p): p is PriceEntry & { Name: string } =>
+      typeof p.Name === 'string' && p.Name.length > 0,
+    )
+    .map(
+      (p): BulkResultEntry => ({
+        domain: `${word}.${p.Name}`,
+        tld: p.Name,
+        status: 'PENDING',
+        price: extractRegistrationPrice(p),
+      }),
+    )
+    .sort((a, b) => compareByPopularity(a.tld, b.tld));
+
+  const body: BulkSuccessBody = {
+    kind: 'bulk',
+    word,
+    results,
+    throttleMs: getThrottleMs(),
+  };
+  const response = NextResponse.json(body);
+  setThrottleCookie(response);
+  return response;
+};
 
 export async function POST(req: NextRequest) {
   const throttle = checkThrottle(req);
   if (throttle.throttled) {
     return NextResponse.json(
-      {
-        error: 'Too many requests. Please wait.',
-        retryAfter: throttle.retryAfter,
-      },
+      { error: 'Too many requests. Please wait.', retryAfter: throttle.retryAfter },
       { status: 429 },
     );
   }
@@ -94,24 +213,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const run =
-    parsed.kind === 'word'
-      ? await start(scanWordWorkflow, [parsed.word])
-      : await start(checkDomainWorkflow, [parsed.domain]);
+  const client = makeClient();
 
-  const meta: MetaMessage = {
-    type: 'meta',
-    kind: parsed.kind === 'word' ? 'bulk' : 'single',
-    throttleMs: getThrottleMs(),
-  };
-
-  const response = new NextResponse(ndjson(meta, run.readable), {
-    headers: {
-      'Content-Type': 'application/x-ndjson; charset=utf-8',
-      'Cache-Control': 'no-store, no-transform',
-      'X-Accel-Buffering': 'no',
-    },
-  });
-  setThrottleCookie(response);
-  return response;
+  return parsed.kind === 'word'
+    ? handleBulk(client, parsed.word)
+    : handleSingle(client, parsed.domain);
 }

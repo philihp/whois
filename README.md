@@ -5,7 +5,6 @@ Minimal Next.js app that checks domain availability and registration price using
 ## Stack
 
 - Next.js 16 (App Router, Turbopack) + TypeScript 7
-- [Vercel Workflows](https://vercel.com/docs/workflows) (`workflow`) for the parallel fan-out
 - AWS SDK v3 (`@aws-sdk/client-route-53-domains`)
 - Ramda for the pure helpers
 - Vitest for tests
@@ -25,52 +24,13 @@ Open http://localhost:3000.
 
 ## How it works
 
-The front end posts `{ domain }` to `/api/check-domain`. The route validates and
-normalizes the input (`lib/domain.ts`), starts a Vercel Workflow, and streams the
-workflow's output back to the browser as NDJSON — one JSON message per line
-(`lib/protocol.ts`), flushed as soon as it is produced.
+The front end posts `{ domain }` to `/api/check-domain`. The route handler:
 
-Two workflows live in `workflows/domain-scan.ts`:
+1. Validates and normalizes the input (`lib/domain.ts`).
+2. Calls `CheckDomainAvailabilityCommand` against Route 53 Domains (us-east-1).
+3. Best-effort calls `ListPricesCommand` for the matching TLD and returns the registration price.
 
-- **`checkDomainWorkflow(domain)`** — a full domain. Availability
-  (`CheckDomainAvailability`) and pricing (`ListPrices`) are independent, so they
-  run as two parallel steps.
-- **`scanWordWorkflow(word)`** — a bare word. One step pages the whole Route 53
-  price list and streams the TLD table (sorted by popularity) so the UI can paint
-  every row immediately. Then **every TLD is checked in parallel** — one
-  `"use step"` per domain, all launched from a single `Promise.all`. Each step
-  writes its `{ domain, status }` row to the run's stream the moment it resolves,
-  so rows fill in as they land rather than in list order.
-
-Because each check is its own step, AWS throttling is handled per-domain instead
-of stalling the whole scan: a throttled call throws a `RetryableError` with
-exponential backoff and is retried on a fresh invocation, while the rest of the
-fan-out keeps going. Any other failure marks that single row `ERROR`.
-
-Pricing is only available for TLDs Amazon Registrar supports. If pricing is
-missing, the UI shows "price unavailable" but still shows availability.
-
-### Streaming protocol
-
-| message | when |
-| --- | --- |
-| `{ type: "meta", kind, throttleMs }` | first line, sent by the route |
-| `{ type: "tlds", word, entries }` | bulk scan: the TLD table with prices |
-| `{ type: "status", domain, status }` | one per parallel availability check |
-| `{ type: "single", domain, status, price }` | single-domain lookup result |
-| `{ type: "error", error }` | the run failed; the stream then closes |
-
-Aborting the request client-side (navigating away, hiding the tab, or starting a
-new query) cancels the response; `vercel.json` sets `supportsCancellation` on the
-route so Vercel tears the invocation down instead of billing it to the max
-duration.
-
-### Inspecting runs
-
-```bash
-npx workflow web       # observability web UI
-npx workflow inspect runs
-```
+Pricing is only available for TLDs Amazon Registrar supports. If pricing is missing, the UI shows "price unavailable" but still shows availability.
 
 ## Setup checklist
 
@@ -128,8 +88,6 @@ The included `.github/workflows/ci.yml` runs lint, typecheck, tests, and a build
 ## Notes
 
 - `validate` strips protocols, paths, and `www.`, then checks against an RFC-flavored regex.
-- `next.config.ts` is wrapped in `withWorkflow()`, which is what enables the `"use workflow"` and `"use step"` directives.
-- A bulk scan runs one function invocation per TLD. That is the cost of true parallelism — expect a few hundred short invocations per scan.
 - TLD matching uses longest-suffix match so `example.co.uk` correctly maps to the `co.uk` price entry, not `uk`.
 - Failures in pricing are swallowed; availability still returns.
 - AWS errors return HTTP 502 with `{ error, detail }`.
