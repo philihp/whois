@@ -8,7 +8,7 @@ import {
 import { getTld, pickPriceForDomain } from './pricing';
 import { compareByPopularity, tldRank } from './popularity';
 import { encodeMessage, parseMessage, splitLines } from './protocol';
-import { isThrottlingError } from './aws';
+import { isThrottlingError, toAwsErrorMessage } from './aws';
 
 describe('normalizeDomain', () => {
   it('lowercases and trims', () => {
@@ -167,5 +167,23 @@ describe('isThrottlingError', () => {
     expect(isThrottlingError(new Error('boom'))).toBe(false);
     expect(isThrottlingError({ name: 'AccessDeniedException' })).toBe(false);
     expect(isThrottlingError(null)).toBe(false);
+  });
+});
+
+describe('toAwsErrorMessage', () => {
+  it('reads the message off an Error', () => {
+    expect(toAwsErrorMessage(new Error('boom'))).toBe('boom');
+  });
+  it('reads the message off a rehydrated step error (plain object)', () => {
+    // Errors crossing a step boundary arrive serialized, not as Error instances.
+    expect(toAwsErrorMessage({ name: 'ThrottlingException', message: 'Rate exceeded' }))
+      .toBe('Rate exceeded');
+  });
+  it('accepts a bare string', () => {
+    expect(toAwsErrorMessage('nope')).toBe('nope');
+  });
+  it('falls back when there is nothing to read', () => {
+    expect(toAwsErrorMessage({})).toBe('Unknown error from AWS');
+    expect(toAwsErrorMessage(null)).toBe('Unknown error from AWS');
   });
 });

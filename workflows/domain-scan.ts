@@ -26,6 +26,18 @@ type Sink = WritableStream<Uint8Array>;
 // keeps going — and the step is retried on a fresh invocation.
 const MAX_AVAILABILITY_RETRIES = 8;
 
+// How many availability checks may be in flight at once.
+//
+// Firing all ~400 TLDs at once does not work: Route 53 throttles the burst so
+// hard that steps exhaust their retry budget and give up. A measured run of an
+// unbounded fan-out returned 168 ERROR rows out of 301 — worse than useless,
+// since an ERROR row is indistinguishable from "we did not check".
+//
+// Striping the work across a fixed number of concurrent lanes keeps the scan
+// parallel (and far faster than the serial version this replaced) while staying
+// inside what AWS will actually serve.
+const FANOUT_LANES = 12;
+
 const backoffMs = (attempt: number): number =>
   Math.min(2 ** attempt * 250, 20_000) + Math.floor(Math.random() * 250);
 
@@ -177,8 +189,16 @@ export async function scanWordWorkflow(word: string) {
     const entries = await listTldEntries(word);
     await emit(writable, { type: 'tlds', word, entries });
 
+    // Lane w handles entries w, w+LANES, w+2*LANES, ... Indexing by position
+    // rather than draining a shared queue keeps the workflow deterministic on
+    // replay, and striping the popularity-sorted list means the TLDs people
+    // actually care about resolve in the first wave.
     await Promise.all(
-      entries.map((entry) => checkAvailability(entry.domain, writable)),
+      R.range(0, Math.min(FANOUT_LANES, entries.length)).map(async (lane) => {
+        for (let i = lane; i < entries.length; i += FANOUT_LANES) {
+          await checkAvailability(entries[i].domain, writable);
+        }
+      }),
     );
     checked = entries.length;
   } catch (err) {
